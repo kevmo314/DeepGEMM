@@ -1,7 +1,8 @@
 # Builds the DeepGEMM wheels ninetyfive installs (free-threaded CPython 3.14t,
 # torch 2.10 + CUDA 13.0) for x86_64 and aarch64, and attaches them to the
 # release. DeepGEMM JIT-compiles its kernels at runtime; the wheel only carries
-# the C++ extension (tied to TORCH_VERSION) and the kernel headers.
+# the C++ extension (tied to TORCH_VERSION) and the kernel headers. Each job also
+# precompiles ninetyfive's W8A8 kernels (no GPU needed) into a cache tarball.
 
 name: Build ninetyfive wheels
 
@@ -24,6 +25,13 @@ env:
   TORCH_INDEX: "https://download.pytorch.org/whl/cu130"
   CUDA_VERSION: "13.0.1"
   RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  # The nvcc ninetyfive JIT-compiles with (its pyproject pins), part of every cache key.
+  NVCC_WHEELS: "nvidia-cuda-nvcc==13.0.88 nvidia-nvvm==13.0.88 nvidia-cuda-cccl==13.0.85"
+  # (N, K) of the FP8 projections of the models ninetyfive serves, after fusion:
+  # Qwen3.8-27B-FP8's qkv, in_proj_qkvz, o_proj/out_proj, gate_up_proj, down_proj.
+  PRECOMPILE_SHAPES: "[[14336, 5120], [16384, 5120], [5120, 6144], [34816, 5120], [5120, 17408]]"
+  # H100 SXM, H200 and GH200; H100 PCIe.
+  PRECOMPILE_NUM_SMS: "[132, 114]"
 
 defaults:
   run:
@@ -108,11 +116,34 @@ jobs:
           python -m pip install --no-deps dist/*.whl
           cd /tmp && python -c "import torch, deep_gemm; print(deep_gemm.__version__, deep_gemm.__file__)"
 
+      - name: Precompile kernels
+        # Every prefill row count ninetyfive gives DeepGEMM: multiples of 128 up to 8192.
+        run: |
+          python -m pip install ${NVCC_WHEELS}
+          export CUDA_HOME="$(python -c 'import importlib.metadata as m, pathlib; print(next(pathlib.Path(f.locate()).parent.parent for f in m.files("nvidia-cuda-nvcc") if f.name == "nvcc"))')"
+          export DG_JIT_CACHE_DIR="${PWD}/deep_gemm_cache"
+          "${CUDA_HOME}/bin/nvcc" --version
+          cd /tmp && python - <<'PY'
+          import json, os, time
+          import deep_gemm
+          shapes = json.loads(os.environ["PRECOMPILE_SHAPES"])
+          num_sms = json.loads(os.environ["PRECOMPILE_NUM_SMS"])
+          start, kernels = time.monotonic(), set()
+          for sms in num_sms:
+              for n, k in shapes:
+                  for m in range(128, 8193, 128):
+                      kernels.add(deep_gemm.precompile_fp8_gemm_nt(m, n, k, sms))
+          print(f"{len(kernels)} kernels in {time.monotonic() - start:.0f}s")
+          PY
+          cd - && rm -rf deep_gemm_cache/tmp
+          tar -czf "dist/deep_gemm_cache-cu130-sm90-$(uname -m).tar.gz" -C deep_gemm_cache .
+          ls -la dist
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: deep-gemm-${{ matrix.os }}
-          path: dist/*.whl
+          path: dist/*
 
       - name: Upload to release
         env:
@@ -120,7 +151,7 @@ jobs:
         # uploads.github.com intermittently answers HTTP 500; retry.
         run: |
           for attempt in 1 2 3 4 5; do
-            gh release upload "${RELEASE_TAG}" dist/*.whl --clobber --repo "${GITHUB_REPOSITORY}" && exit 0
+            gh release upload "${RELEASE_TAG}" dist/* --clobber --repo "${GITHUB_REPOSITORY}" && exit 0
             sleep $((attempt * 15))
           done
           exit 1
