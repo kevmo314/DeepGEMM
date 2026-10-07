@@ -12,6 +12,17 @@ try:
 except ImportError:
     pass
 
+# The JIT finds nvcc through CUDA_HOME, and cache keys hash its version: default to the
+# nvidia-cuda-nvcc wheel, which the precompiled kernels below were compiled with
+if 'CUDA_HOME' not in os.environ and 'CUDA_PATH' not in os.environ:
+    import importlib.metadata
+    try:
+        _nvcc = next((f for f in importlib.metadata.files('nvidia-cuda-nvcc') or () if f.name == 'nvcc'), None)
+        if _nvcc is not None:
+            os.environ['CUDA_HOME'] = str(_nvcc.locate().resolve().parent.parent)
+    except importlib.metadata.PackageNotFoundError:
+        pass
+
 # Kernels precompiled into the wheel: a read-only JIT cache root after the writable one
 _precompiled = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'precompiled')
 if os.path.isdir(os.path.join(_precompiled, 'cache')):
