@@ -26,8 +26,9 @@ public:
         CUtensorMap tensor_map_sfa;
     };
 
-    static void compile_and_launch(const std::string& tag, const Args& args) {
-        const auto kernel = jit->compile(tag, std::format(R"(
+    static std::string generate(const GemmDesc& gemm_desc, const GemmConfig& gemm_config,
+                                const cute::UMMA::Major& major_sfb) {
+        return std::format(R"(
 #include <deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh>
 
 using namespace deep_gemm;
@@ -47,18 +48,22 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
-        to_string(args.major_sfb),
-        get_compiled_dim(args.gemm_desc.m, 'm', args.gemm_desc.compiled_dims),
-        get_compiled_dim(args.gemm_desc.n, 'n', args.gemm_desc.compiled_dims),
-        get_compiled_dim(args.gemm_desc.k, 'k', args.gemm_desc.compiled_dims),
-        args.gemm_desc.num_groups,
-        args.gemm_config.layout.block_m, args.gemm_config.layout.block_n, args.gemm_config.layout.block_k,
-        args.gemm_config.storage_config.swizzle_a_mode, args.gemm_config.storage_config.swizzle_b_mode, args.gemm_config.storage_config.swizzle_cd_mode,
-        args.gemm_config.pipeline_config.num_stages,
-        args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
-        args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
-        args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
-        to_string(args.gemm_desc.cd_dtype)));
+        to_string(major_sfb),
+        get_compiled_dim(gemm_desc.m, 'm', gemm_desc.compiled_dims),
+        get_compiled_dim(gemm_desc.n, 'n', gemm_desc.compiled_dims),
+        get_compiled_dim(gemm_desc.k, 'k', gemm_desc.compiled_dims),
+        gemm_desc.num_groups,
+        gemm_config.layout.block_m, gemm_config.layout.block_n, gemm_config.layout.block_k,
+        gemm_config.storage_config.swizzle_a_mode, gemm_config.storage_config.swizzle_b_mode, gemm_config.storage_config.swizzle_cd_mode,
+        gemm_config.pipeline_config.num_stages,
+        gemm_config.launch_config.num_tma_threads, gemm_config.launch_config.num_math_threads,
+        gemm_config.layout.get_cluster_size(), gemm_config.layout.cluster_n > 1,
+        gemm_config.launch_config.num_sms, to_string(gemm_desc.gemm_type),
+        to_string(gemm_desc.cd_dtype));
+    }
+
+    static void compile_and_launch(const std::string& tag, const Args& args) {
+        const auto kernel = jit->compile(tag, generate(args.gemm_desc, args.gemm_config, args.major_sfb));
 
         // Launch
         jit->launch(
@@ -134,6 +139,33 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .tensor_map_d = tensor_map_d,
         .tensor_map_sfa = tensor_map_sfa,
     });
+}
+
+// Compiles the kernel `sm90_fp8_gemm_1d2d` would launch for an FP8 [m, k] x [n, k]^T GEMM with
+// BF16 output and K-major operands and SFB into the disk cache, without a GPU: for `num_sms` SMs
+// and `arch` (e.g., "90a"). Returns the cache entry.
+static std::filesystem::path sm90_fp8_gemm_1d2d_precompile(const int& m, const int& n, const int& k,
+                                                           const int& num_sms, const std::string& arch,
+                                                           const std::string& compiled_dims) {
+    const auto desc = GemmDesc {
+        .gemm_type = GemmType::Normal,
+        .kernel_type = KernelType::Kernel1D2D,
+        .m = m, .n = n, .k = k, .num_groups = 1,
+        .a_dtype = torch::kFloat8_e4m3fn, .b_dtype = torch::kFloat8_e4m3fn,
+        .cd_dtype = torch::kBFloat16,
+        .major_a = cute::UMMA::Major::K, .major_b = cute::UMMA::Major::K,
+        .with_accumulation = false,
+        .num_sms = num_sms,
+        // `Runtime::get_tc_util()` unless `set_tc_util` was called
+        .tc_util = 100,
+        .compiled_dims = compiled_dims
+    };
+    const auto config = get_best_config<SM90ArchSpec>(desc);
+    deep_jit::cuda::CompilerOptions options;
+    options.arch = arch;
+    return jit->compile_without_load("sm90_fp8_gemm_1d2d",
+                                     SM90FP8Gemm1D2DRuntime::generate(desc, config, cute::UMMA::Major::K),
+                                     options);
 }
 
 static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
