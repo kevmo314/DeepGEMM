@@ -1,8 +1,8 @@
 # Builds the DeepGEMM wheels ninetyfive installs (free-threaded CPython 3.14t,
 # torch 2.10 + CUDA 13.0) for x86_64 and aarch64, and attaches them to the
 # release. DeepGEMM JIT-compiles its kernels at runtime; the wheel only carries
-# the C++ extension (tied to TORCH_VERSION) and the kernel headers. Each job also
-# precompiles ninetyfive's W8A8 kernels (no GPU needed) into a cache tarball.
+# the C++ extension (tied to TORCH_VERSION) and the kernel headers, plus
+# ninetyfive's W8A8 kernels precompiled (no GPU needed) as a read-only cache.
 
 name: Build ninetyfive wheels
 
@@ -98,30 +98,28 @@ jobs:
           nvcc --version
           g++-13 --version
 
-      - name: Build wheel
+      - name: Build the extension
         run: |
           # Build here instead of fetching an upstream wheel (there are no cp314t ones).
-          export DG_FORCE_BUILD=1
-          export DG_USE_LOCAL_VERSION=0
-          export LDSHARED="g++-13 -shared"
           # Tag the version itself so the wheel name and METADATA agree.
           local_tag="cu130torch${TORCH_VERSION%.*}"
           sed -i -E "s/^(__version__ = '[^'+]+)'/\1+${local_tag}'/" deep_gemm/__init__.py
           grep '^__version__' deep_gemm/__init__.py
-          python setup.py bdist_wheel --dist-dir=dist
-          ls -la dist
-
-      - name: Check the wheel imports
-        run: |
-          python -m pip install --no-deps dist/*.whl
-          cd /tmp && python -c "import torch, deep_gemm; print(deep_gemm.__version__, deep_gemm.__file__)"
+          echo "DG_FORCE_BUILD=1" >> "$GITHUB_ENV"
+          echo "DG_USE_LOCAL_VERSION=0" >> "$GITHUB_ENV"
+          echo "LDSHARED=g++-13 -shared" >> "$GITHUB_ENV"
+          DG_FORCE_BUILD=1 DG_USE_LOCAL_VERSION=0 LDSHARED="g++-13 -shared" \
+            python setup.py bdist_wheel --dist-dir=build/stage1
+          python -m pip install --no-deps build/stage1/*.whl
 
       - name: Precompile kernels
-        # Every prefill row count ninetyfive gives DeepGEMM: multiples of 128 up to 8192.
+        # With the built extension (the cache keys hash its kernel headers) and the
+        # nvcc ninetyfive runs; every prefill row count ninetyfive gives DeepGEMM:
+        # multiples of 128 up to 8192.
         run: |
           python -m pip install ${NVCC_WHEELS}
           export CUDA_HOME="$(python -c 'import importlib.metadata as m, pathlib; print(next(pathlib.Path(f.locate()).parent.parent for f in m.files("nvidia-cuda-nvcc") if f.name == "nvcc"))')"
-          export DG_JIT_CACHE_DIR="${PWD}/deep_gemm_cache"
+          export DG_JIT_CACHE_DIR="${PWD}/precompiled"
           "${CUDA_HOME}/bin/nvcc" --version
           cd /tmp && python - <<'PY'
           import json, os, time
@@ -135,15 +133,31 @@ jobs:
                       kernels.add(deep_gemm.precompile_fp8_gemm_nt(m, n, k, sms))
           print(f"{len(kernels)} kernels in {time.monotonic() - start:.0f}s")
           PY
-          cd - && rm -rf deep_gemm_cache/tmp
-          tar -czf "dist/deep_gemm_cache-cu130-sm90-$(uname -m).tar.gz" -C deep_gemm_cache .
+          cd - && rm -rf precompiled/tmp && du -sh precompiled
+
+      - name: Build wheel
+        run: |
+          python setup.py bdist_wheel --dist-dir=dist
           ls -la dist
+
+      - name: Check the wheel
+        # Imports, and finds its precompiled kernels from an empty writable cache.
+        run: |
+          python -m pip install --no-deps --force-reinstall dist/*.whl
+          export CUDA_HOME="$(python -c 'import importlib.metadata as m, pathlib; print(next(pathlib.Path(f.locate()).parent.parent for f in m.files("nvidia-cuda-nvcc") if f.name == "nvcc"))')"
+          export DG_JIT_CACHE_DIR="$(mktemp -d)"
+          cd /tmp && python - <<'PY'
+          import os, deep_gemm
+          print(deep_gemm.__version__, os.environ["DG_JIT_CACHE_DIR"])
+          path = deep_gemm.precompile_fp8_gemm_nt(256, 5120, 6144, 132)
+          assert path.startswith(os.path.dirname(deep_gemm.__file__)), path
+          PY
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: deep-gemm-${{ matrix.os }}
-          path: dist/*
+          path: dist/*.whl
 
       - name: Upload to release
         env:
@@ -151,7 +165,7 @@ jobs:
         # uploads.github.com intermittently answers HTTP 500; retry.
         run: |
           for attempt in 1 2 3 4 5; do
-            gh release upload "${RELEASE_TAG}" dist/* --clobber --repo "${GITHUB_REPOSITORY}" && exit 0
+            gh release upload "${RELEASE_TAG}" dist/*.whl --clobber --repo "${GITHUB_REPOSITORY}" && exit 0
             sleep $((attempt * 15))
           done
           exit 1

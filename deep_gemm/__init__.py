@@ -12,6 +12,13 @@ try:
 except ImportError:
     pass
 
+# Kernels precompiled into the wheel: a read-only JIT cache root after the writable one
+_precompiled = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'precompiled')
+if os.path.isdir(os.path.join(_precompiled, 'cache')):
+    _roots = os.environ.get('DG_JIT_CACHE_DIR') or os.path.join(os.path.expanduser('~'), '.dj')
+    if _precompiled not in _roots.split(':'):
+        os.environ['DG_JIT_CACHE_DIR'] = f'{_roots}:{_precompiled}'
+
 # Configs
 from . import _C
 from ._C import (

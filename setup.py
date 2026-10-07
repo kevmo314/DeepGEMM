@@ -122,8 +122,18 @@ class CustomBuildPy(build_py):
         # Fourth, copy csrc and docs into the wheel for agent-side error lookup
         self.prepare_agent_files()
 
+        # Fifth, ship kernels precompiled into `precompiled/` (if any) as a read-only JIT cache
+        self.prepare_precompiled()
+
         # Finally, run the regular build
         build_py.run(self)
+
+    def prepare_precompiled(self):
+        src = os.path.join(current_dir, 'precompiled', 'cache')
+        if os.path.isdir(src):
+            dst = os.path.join(self.build_lib, 'deep_gemm', 'precompiled', 'cache')
+            shutil.rmtree(dst, ignore_errors=True)
+            shutil.copytree(src, dst)
 
     def prepare_agent_files(self):
         # Copy csrc and docs into the wheel for agent-side error lookup
