@@ -114,13 +114,13 @@ jobs:
 
       - name: Precompile kernels
         # With the built extension (the cache keys hash its kernel headers) and the
-        # nvcc ninetyfive runs; every prefill row count ninetyfive gives DeepGEMM:
-        # multiples of 128 up to 8192.
+        # nvidia-cuda-nvcc wheel (deep_gemm's default CUDA_HOME); every prefill row
+        # count ninetyfive gives DeepGEMM: multiples of 128 up to 8192.
         run: |
           python -m pip install ${NVCC_WHEELS}
-          export CUDA_HOME="$(python -c 'import importlib.metadata as m, pathlib; print(next(pathlib.Path(f.locate()).parent.parent for f in m.files("nvidia-cuda-nvcc") if f.name == "nvcc"))')"
+          unset CUDA_HOME CUDA_PATH
           export DG_JIT_CACHE_DIR="${PWD}/precompiled"
-          "${CUDA_HOME}/bin/nvcc" --version
+          (cd /tmp && python -c 'import deep_gemm, os; print(os.environ["CUDA_HOME"])')
           cd /tmp && python - <<'PY'
           import json, os, time
           import deep_gemm
@@ -144,7 +144,7 @@ jobs:
         # Imports, and finds its precompiled kernels from an empty writable cache.
         run: |
           python -m pip install --no-deps --force-reinstall dist/*.whl
-          export CUDA_HOME="$(python -c 'import importlib.metadata as m, pathlib; print(next(pathlib.Path(f.locate()).parent.parent for f in m.files("nvidia-cuda-nvcc") if f.name == "nvcc"))')"
+          unset CUDA_HOME CUDA_PATH
           export DG_JIT_CACHE_DIR="$(mktemp -d)"
           cd /tmp && python - <<'PY'
           import os, deep_gemm
