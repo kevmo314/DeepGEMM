@@ -832,7 +832,24 @@ static void batched_symm(const torch::Tensor& a, const torch::Tensor& b,
     cublaslt_batched_gemm(a_3d, b_transposed, d_3d, m, k, m, num_batches, major_a, major_b);
 }
 
+// Ahead-of-time compilation of the SM90 kernel `fp8_fp4_gemm_nt` launches for FP8 [m, k] x [n, k]^T
+// GEMMs with 1x128 SFA and 128x128 SFB (FP32, as with `disable_ue8m0_cast`) and BF16 output, for a
+// GPU with `num_sms` SMs. Works without a GPU; the kernel lands in the disk cache.
+static std::string precompile_fp8_gemm_nt(const int& m, const int& n, const int& k,
+                                          const int& num_sms, const std::string& compiled_dims) {
+    if (not deep_jit::cuda::Device::emulated.has_value()) {
+        cudaDeviceProp prop{};
+        prop.major = 9, prop.minor = 0;
+        prop.multiProcessorCount = num_sms;
+        deep_jit::cuda::Device::emulated = prop;
+    }
+    return sm90_fp8_gemm_1d2d_precompile(m, n, k, num_sms, "90a", compiled_dims).string();
+}
+
 static void register_apis(pybind11::module_& m) {
+    m.def("precompile_fp8_gemm_nt", &precompile_fp8_gemm_nt,
+          py::arg("m"), py::arg("n"), py::arg("k"), py::arg("num_sms"),
+          py::arg("compiled_dims") = "nk");
 
     // FP8 FP4 GEMMs
     m.def("fp8_fp4_gemm_nt", &fp8_fp4_gemm_nt,

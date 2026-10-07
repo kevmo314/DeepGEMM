@@ -47,6 +47,8 @@ from ._C import (
     fp4_gemm_nt,
     fp8_gemm_nt, fp8_gemm_nn,
     fp8_gemm_tn, fp8_gemm_tt,
+    # Ahead-of-time compilation (no GPU needed)
+    precompile_fp8_gemm_nt,
     m_grouped_fp4_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nn_contiguous,
