@@ -73,6 +73,14 @@ jobs:
           linux-local-args: '["--toolkit"]'
           sub-packages: '["nvcc", "cudart", "cccl"]'
 
+      - name: Install CUDA library headers
+        # torch's ATen/cuda/CUDAContext.h includes the cuBLAS, cuSPARSE and
+        # cuSOLVER headers (from the CUDA apt repository the step above added).
+        run: |
+          v="${CUDA_VERSION%.*}"; v="${v/./-}"
+          sudo apt-get install -y --no-install-recommends \
+            "libcublas-dev-${v}" "libcusparse-dev-${v}" "libcusolver-dev-${v}" "libcurand-dev-${v}"
+
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
