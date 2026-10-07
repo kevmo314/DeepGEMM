@@ -22,3 +22,6 @@ stubs/
 
 # Symlinks to compiled extensions
 deep_gemm/*.so
+
+# Kernels precompiled for the wheel (ninetyfive-wheels workflow)
+/precompiled
