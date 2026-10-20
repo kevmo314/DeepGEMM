@@ -23,22 +23,37 @@
 
 namespace deep_gemm {
 
-// SiLU(gate) * up of the BF16-rounded accumulators, with the instructions (and so the
-// rounding) of a Triton `gate * tl.sigmoid(gate) * up` in FP32: the unfused path writes
-// the GEMM output in BF16, then computes this
-CUTLASS_DEVICE float swiglu_of_bf16(const float& gate_accum, const float& up_accum) {
-    const float g = __bfloat162float(__float2bfloat16_rn(gate_accum));
-    const float u = __bfloat162float(__float2bfloat16_rn(up_accum));
+// SiLU(gate) * up of the BF16-rounded accumulators, before its own BF16 rounding, bit for
+// bit as a Triton `gate * tl.sigmoid(gate) * up` in FP32 (the unfused path writes the GEMM
+// output in BF16, then computes this): `1 / (1 + ex2(-gate * log2(e)))` with
+// `ex2.approx` and `div.full`, without the range fix-ups that cannot change the result:
+//  - `ex2.approx` rescales inputs below -126 to produce denormals: flushing them to zero
+//    instead leaves `1 + e` at 1 either way
+//  - `div.full(1, d)` is `rcp.approx(d)` times 1, after scaling both by 1/4 above 2^126,
+//    or by 2^24 below 2^-126, which `d >= 1` never is
+//  - Triton's `(0 - g) * log2(e)` is `g * -log2(e)` exactly (a zero's sign aside, which
+//    `ex2` drops)
+CUTLASS_DEVICE float swiglu_of_bf16_unrounded(const float& g, const float& u) {
     float t, e, d, sig, y;
-    const float zero = 0.0f, one = 1.0f;
-    asm volatile("sub.f32 %0, %1, %2;" : "=f"(t) : "f"(zero), "f"(g));
-    asm volatile("mul.f32 %0, %1, 0f3FB8AA3B;" : "=f"(t) : "f"(t));
-    asm volatile("ex2.approx.f32 %0, %1;" : "=f"(e) : "f"(t));
-    asm volatile("add.f32 %0, %1, 0f3F800000;" : "=f"(d) : "f"(e));
-    asm volatile("div.full.f32 %0, %1, %2;" : "=f"(sig) : "f"(one), "f"(d));
-    asm volatile("mul.f32 %0, %1, %2;" : "=f"(y) : "f"(sig), "f"(g));
-    asm volatile("mul.f32 %0, %1, %2;" : "=f"(y) : "f"(y), "f"(u));
-    return __bfloat162float(__float2bfloat16_rn(y));
+    asm("mul.f32 %0, %1, 0fBFB8AA3B;" : "=f"(t) : "f"(g));
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"(t));
+    asm("add.f32 %0, %1, 0f3F800000;" : "=f"(d) : "f"(e));
+    asm("{\n\t.reg .pred big;\n\t.reg .f32 num, den, r;\n\t"
+        "setp.gt.f32 big, %1, 0f7E800000;\n\t"
+        "selp.f32 num, 0f3E800000, 0f3F800000, big;\n\t"
+        "mul.f32 den, %1, num;\n\t"
+        "rcp.approx.ftz.f32 r, den;\n\t"
+        "mul.f32 %0, r, num;\n\t}" : "=f"(sig) : "f"(d));
+    asm("mul.f32 %0, %1, %2;" : "=f"(y) : "f"(sig), "f"(g));
+    asm("mul.f32 %0, %1, %2;" : "=f"(y) : "f"(y), "f"(u));
+    return y;
+}
+
+// BF16 rounding of two values, as one packed conversion
+CUTLASS_DEVICE void round_bf16x2(float& a, float& b) {
+    const auto v = __floats2bfloat162_rn(a, b);
+    const auto bits = *reinterpret_cast<const uint32_t*>(&v);
+    a = __uint_as_float(bits << 16), b = __uint_as_float(bits & 0xffff0000u);
 }
 
 CUTLASS_DEVICE float div_full(const float& a, const float& b) {
@@ -47,11 +62,22 @@ CUTLASS_DEVICE float div_full(const float& a, const float& b) {
     return r;
 }
 
-// Two values quantized as `(y / scale).to(tl.float8e4nv)`: `lo` in the low byte
-CUTLASS_DEVICE uint16_t quantize_e4m3x2(const float& lo, const float& hi, const float& scale) {
-    const float q_lo = div_full(lo, scale), q_hi = div_full(hi, scale);
+// For `div.full(y, scale)` as `y * rcp_of_scale(scale)`: a quantization scale lies in
+// [1e-12, FLT_MAX / 448], where `div.full` does not rescale (or is `inf`, where the two agree)
+CUTLASS_DEVICE float rcp_of_scale(const float& scale) {
+    float r;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(scale));
+    return r;
+}
+
+// Two values quantized as `(y / scale).to(tl.float8e4nv)`, given `rcp_of_scale(scale)`:
+// `lo` in the low byte
+CUTLASS_DEVICE uint16_t quantize_e4m3x2(const float& lo, const float& hi, const float& scale_rcp) {
+    float q_lo, q_hi;
+    asm("mul.f32 %0, %1, %2;" : "=f"(q_lo) : "f"(lo), "f"(scale_rcp));
+    asm("mul.f32 %0, %1, %2;" : "=f"(q_hi) : "f"(hi), "f"(scale_rcp));
     uint16_t r;
-    asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(q_hi), "f"(q_lo));
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(q_hi), "f"(q_lo));
     return r;
 }
 
@@ -300,20 +326,25 @@ sm90_fp8_gemm_1d2d_swiglu_impl(float* sfb, float* sd, uint32_t shape_m_pad,
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumGateGroups; ++ i) {
                     #pragma unroll
-                    for (uint32_t j = 0; j < 4; ++ j) {
-                        auto& y = final_accum[t][i * 4 + j];
-                        y = swiglu_of_bf16(y, final_accum[t][(i + kNumGateGroups) * 4 + j]);
-                        row_max[j / 2] = fmaxf(row_max[j / 2], fabsf(y));
+                    for (uint32_t j = 0; j < 4; j += 2) {
+                        float g_0 = final_accum[t][i * 4 + j], u_0 = final_accum[t][(i + kNumGateGroups) * 4 + j];
+                        float g_1 = final_accum[t][i * 4 + j + 1], u_1 = final_accum[t][(i + kNumGateGroups) * 4 + j + 1];
+                        round_bf16x2(g_0, u_0), round_bf16x2(g_1, u_1);
+                        float y_0 = swiglu_of_bf16_unrounded(g_0, u_0), y_1 = swiglu_of_bf16_unrounded(g_1, u_1);
+                        round_bf16x2(y_0, y_1);
+                        final_accum[t][i * 4 + j] = y_0, final_accum[t][i * 4 + j + 1] = y_1;
+                        row_max[j / 2] = fmaxf(row_max[j / 2], fmaxf(fabsf(y_0), fabsf(y_1)));
                     }
                 }
             }
-            float row_scale[2];
+            float row_scale[2], row_scale_rcp[2];
             #pragma unroll
             for (uint32_t r = 0; r < 2; ++ r) {
                 float m = row_max[r];
                 m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, 1));
                 m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, 2));
                 row_scale[r] = fmaxf(div_full(m, 448.0f), 1e-12f);
+                row_scale_rcp[r] = rcp_of_scale(row_scale[r]);
             }
 
             // Wait for the last TMA store to finish reading the output tile
@@ -333,7 +364,7 @@ sm90_fp8_gemm_1d2d_swiglu_impl(float* sfb, float* sd, uint32_t shape_m_pad,
                         const uint32_t col = t * (kNumGroupOutputs / kNumTiles) + i * 8 + (lane_idx % 4) * 2;
                         const uint32_t chunk = (col / 16) ^ (row % 8);
                         *reinterpret_cast<uint16_t*>(smem_q + row * kNumGroupOutputs + chunk * 16 + col % 16) =
-                            quantize_e4m3x2(final_accum[t][i * 4 + j], final_accum[t][i * 4 + j + 1], row_scale[j / 2]);
+                            quantize_e4m3x2(final_accum[t][i * 4 + j], final_accum[t][i * 4 + j + 1], row_scale_rcp[j / 2]);
                     }
                 }
             }
