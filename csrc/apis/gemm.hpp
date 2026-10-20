@@ -4,6 +4,7 @@
 
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
+#include "../jit_kernels/impls/sm90_fp8_gemm_1d2d_swiglu.hpp"
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
@@ -846,7 +847,45 @@ static std::string precompile_fp8_gemm_nt(const int& m, const int& n, const int&
     return sm90_fp8_gemm_1d2d_precompile(m, n, k, num_sms, "90a", compiled_dims).string();
 }
 
+// SM90 FP8 [m, k] x [n, k]^T GEMM of a fused gate/up projection (`b`: gate rows then up rows,
+// 128x128 FP32 block scales) written as SiLU(gate) * up in FP8 with 1x128 scales: `qd`
+// (m_pad, n / 2) and `sd` (n / 256, m_pad), the column-major scales of `qd`. `a` is FP8 with
+// 1x128 FP32 scales stored as `sd` (K stride m_pad)
+static void fp8_gemm_nt_swiglu(const std::pair<torch::Tensor, torch::Tensor>& a,
+                               const std::pair<torch::Tensor, torch::Tensor>& b,
+                               const torch::Tensor& qd, const torch::Tensor& sd,
+                               const int& m) {
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 9);
+    const auto& [a_q, sfa] = a;
+    const auto& [b_q, sfb] = b;
+    DG_HOST_ASSERT(a_q.size(1) == b_q.size(1) and a_q.size(0) >= m);
+    if (m == 0)
+        return;
+    sm90_fp8_gemm_1d2d_swiglu(a_q, sfa, b_q, sfb, qd, sd, m,
+                              static_cast<int>(b_q.size(0)), static_cast<int>(b_q.size(1)),
+                              static_cast<int>(qd.size(0)));
+}
+
+// Ahead-of-time compilation of the SM90 kernels `fp8_gemm_nt_swiglu` launches for an [n, k]
+// gate/up weight, for a GPU with `num_sms` SMs. Works without a GPU; they land in the disk cache
+static std::vector<std::string> precompile_fp8_gemm_nt_swiglu(const int& n, const int& k, const int& num_sms) {
+    if (not deep_jit::cuda::Device::emulated.has_value()) {
+        cudaDeviceProp prop{};
+        prop.major = 9, prop.minor = 0;
+        prop.multiProcessorCount = num_sms;
+        deep_jit::cuda::Device::emulated = prop;
+    }
+    std::vector<std::string> out;
+    for (const auto& entry: sm90_fp8_gemm_1d2d_swiglu_precompile(n, k, num_sms, "90a"))
+        out.push_back(entry.string());
+    return out;
+}
+
 static void register_apis(pybind11::module_& m) {
+    m.def("precompile_fp8_gemm_nt_swiglu", &precompile_fp8_gemm_nt_swiglu,
+          py::arg("n"), py::arg("k"), py::arg("num_sms"));
+    m.def("fp8_gemm_nt_swiglu", &fp8_gemm_nt_swiglu,
+          py::arg("a"), py::arg("b"), py::arg("qd"), py::arg("sd"), py::arg("m"));
     m.def("precompile_fp8_gemm_nt", &precompile_fp8_gemm_nt,
           py::arg("m"), py::arg("n"), py::arg("k"), py::arg("num_sms"),
           py::arg("compiled_dims") = "nk");
