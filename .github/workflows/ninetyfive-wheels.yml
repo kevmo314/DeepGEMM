@@ -32,6 +32,8 @@ env:
   PRECOMPILE_SHAPES: "[[14336, 5120], [16384, 5120], [5120, 6144], [34816, 5120], [5120, 17408]]"
   # H100 SXM, H200 and GH200; H100 PCIe.
   PRECOMPILE_NUM_SMS: "[132, 114]"
+  # Fused gate/up projections whose SwiGLU fp8_gemm_nt_swiglu computes: (n, k).
+  PRECOMPILE_SWIGLU_SHAPES: "[[34816, 5120]]"
 
 defaults:
   run:
@@ -131,6 +133,8 @@ jobs:
               for n, k in shapes:
                   for m in range(128, 8193, 128):
                       kernels.add(deep_gemm.precompile_fp8_gemm_nt(m, n, k, sms))
+              for n, k in json.loads(os.environ["PRECOMPILE_SWIGLU_SHAPES"]):
+                  kernels.update(deep_gemm.precompile_fp8_gemm_nt_swiglu(n, k, sms))
           print(f"{len(kernels)} kernels in {time.monotonic() - start:.0f}s")
           PY
           cd - && rm -rf precompiled/tmp && du -sh precompiled
