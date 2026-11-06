@@ -88,16 +88,24 @@ CUTLASS_DEVICE uint16_t quantize_e4m3x2(const float& lo, const float& hi, const 
 // two 128-row tiles of 64 gate rows and their 64 up rows, loaded side by side, whose
 // gate and up halves each lie in scale block p (gate) or n / 256 + p (up). Per K block,
 // A loads once and the two tiles run as two 128-wide WGMMAs into their own accumulators. With kNumTMAMulticast 2, a
-// cluster's two CTAs take adjacent M blocks of the same pair and share its B loads
+// cluster's two CTAs take adjacent M blocks of the same pair and share its B loads.
+//
+// With `GemmType::MGroupedContiguousWithPsumLayout`, A's rows are sorted by group (expert): group g's
+// rows end at `grouped_layout[g]` and the next group's start at that rounded up to BLOCK_M. B is
+// [kNumGroups, n, k] and `sfb` [kNumGroups, n / 128, k / 128]; each block takes its group's. Rows
+// past a group's end are computed (and written) like the rest, from whatever A holds there
+// (a warp-group with none of the group's rows still runs its WGMMAs: skipping them measured slower)
+// BLOCK_M 32 and 64 take one math warp-group (with 32, its WGMMAs' second 32 rows are discarded)
 template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kSwizzleAMode, uint32_t kSwizzleBMode,
           uint32_t kNumStages,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumTMAMulticast,
-          uint32_t kNumSMs>
+          uint32_t kNumSMs,
+          GemmType kGemmType = GemmType::Normal, uint32_t kNumGroups = 1>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
-sm90_fp8_gemm_1d2d_swiglu_impl(float* sfb, float* sd, uint32_t shape_m_pad,
+sm90_fp8_gemm_1d2d_swiglu_impl(float* sfb, float* sd, int* grouped_layout, uint32_t shape_m_pad,
                                uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                                const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                                const __grid_constant__ cute::TmaDescriptor tensor_map_b,
@@ -110,7 +118,11 @@ sm90_fp8_gemm_1d2d_swiglu_impl(float* sfb, float* sd, uint32_t shape_m_pad,
     // Types
     using WGMMA = typename mma::sm90::FP8MMASelector<BLOCK_N>::type;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
-    DG_STATIC_ASSERT(BLOCK_M == WGMMA::M * 2 and kNumMathThreads == 256, "Two math warp-groups of one wave");
+    DG_STATIC_ASSERT(BLOCK_M == 32 or BLOCK_M == 64 or BLOCK_M == 128, "Invalid block size");
+    DG_STATIC_ASSERT(kNumMathThreads == (BLOCK_M == 128 ? 256 : 128), "A math warp-group per 64 rows, of one wave");
+    DG_STATIC_ASSERT(kGemmType == GemmType::Normal or
+                     (kGemmType == GemmType::MGroupedContiguousWithPsumLayout and kNumTMAMulticast == 1),
+                     "Only normal, or psum-layout M-grouped without multicast");
 
     // Overwrite shape constants if the compiler gives
     shape_m = SHAPE_M != 0 ? SHAPE_M : shape_m;
@@ -185,7 +197,7 @@ sm90_fp8_gemm_1d2d_swiglu_impl(float* sfb, float* sd, uint32_t shape_m_pad,
     // Block scheduler over pairs of tiles: a block is `BLOCK_N * 2` rows of B
     uint32_t m_block_idx, n_block_idx;
     DG_STATIC_ASSERT(kNumTMAMulticast <= 2, "Scheduler does not support > 2 TMA multicast");
-    auto scheduler = sched::Scheduler<GemmType::Normal, BLOCK_M, BLOCK_N * kNumTiles, 1, kNumTMAMulticast, false, kNumSMs>(shape_m, shape_n, shape_k, nullptr);
+    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N * kNumTiles, kNumGroups, kNumTMAMulticast, false, kNumSMs>(shape_m, shape_n, shape_k, grouped_layout);
 
     // Pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
@@ -202,6 +214,8 @@ sm90_fp8_gemm_1d2d_swiglu_impl(float* sfb, float* sd, uint32_t shape_m_pad,
         if (warp_idx == kNumMathThreads / 32 + 2 and cute::elect_one_sync()) {
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
                 const uint32_t num_tma_multicast_b = scheduler.is_tma_multicast_valid(m_block_idx) ? kNumTMAMulticast : 1;
+                // The block's group's B rows
+                const uint32_t b_group_row = kGemmType == GemmType::Normal ? 0 : scheduler.current_group_idx * shape_n;
                 for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                     empty_barriers[stage_idx]->wait(phase ^ 1);
 
@@ -215,7 +229,7 @@ sm90_fp8_gemm_1d2d_swiglu_impl(float* sfb, float* sd, uint32_t shape_m_pad,
                     // swizzling land as one 128-row tile would
                     #pragma unroll
                     for (uint32_t t = 0; t < kNumTiles; ++ t) {
-                        const uint32_t gate_row = (n_block_idx * kNumTiles + t) * (BLOCK_N / 2);
+                        const uint32_t gate_row = b_group_row + (n_block_idx * kNumTiles + t) * (BLOCK_N / 2);
                         #pragma unroll
                         for (uint32_t u = 0; u < 2; ++ u) {
                             tma::copy<BLOCK_K, BLOCK_N / 2, kSwizzleBMode, __nv_fp8_e4m3, false>(&tensor_map_b, &full_barrier,
@@ -239,6 +253,8 @@ sm90_fp8_gemm_1d2d_swiglu_impl(float* sfb, float* sd, uint32_t shape_m_pad,
 
         const auto math_wg_idx = __shfl_sync(0xffffffff, threadIdx.x / 128, 0);
         const auto r_0 = warp_idx * 16 + lane_idx / 4, r_1 = r_0 + 8;
+        // With BLOCK_M 32, the rows of the second half of the warp-group's WGMMAs are discarded
+        const bool has_rows = BLOCK_M >= WGMMA::M or r_0 < BLOCK_M;
 
         auto a_desc = mma::sm90::make_smem_desc(smem_a[0] + math_wg_idx * WGMMA::M * BLOCK_K, 1);
         auto b_desc = mma::sm90::make_smem_desc(smem_b[0], 1);
@@ -253,8 +269,9 @@ sm90_fp8_gemm_1d2d_swiglu_impl(float* sfb, float* sd, uint32_t shape_m_pad,
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             // The group's gate and up block scales, the same for both of its tiles
             if (threadIdx.x >= 32) {
-                const auto gate_sfb = sfb + n_block_idx * shape_k_scales;
-                const auto up_sfb = sfb + (shape_n / (BLOCK_N * kNumTiles) + n_block_idx) * shape_k_scales;
+                const auto group_sfb = sfb + (kGemmType == GemmType::Normal ? 0 : scheduler.current_group_idx * (shape_n / BLOCK_K) * shape_k_scales);
+                const auto gate_sfb = group_sfb + n_block_idx * shape_k_scales;
+                const auto up_sfb = group_sfb + (shape_n / (BLOCK_N * kNumTiles) + n_block_idx) * shape_k_scales;
                 #pragma unroll
                 for (uint32_t i = threadIdx.x - 32; i < shape_k_scales * 2; i += kNumMathThreads - 32)
                     ptx::st_shared(smem_sfb + i, i < shape_k_scales ? gate_sfb[i] : up_sfb[i - shape_k_scales]);
@@ -354,23 +371,25 @@ sm90_fp8_gemm_1d2d_swiglu_impl(float* sfb, float* sd, uint32_t shape_m_pad,
 
             // Quantize into the swizzled FP8 tile: row `row`'s 16-byte chunk `c` sits at
             // chunk `c ^ (row % 8)`
-            #pragma unroll
-            for (uint32_t t = 0; t < kNumTiles; ++ t) {
+            if (has_rows) {
                 #pragma unroll
-                for (uint32_t i = 0; i < kNumGateGroups; ++ i) {
+                for (uint32_t t = 0; t < kNumTiles; ++ t) {
                     #pragma unroll
-                    for (uint32_t j = 0; j < 4; j += 2) {
-                        const uint32_t row = j == 0 ? r_0 : r_1;
-                        const uint32_t col = t * (kNumGroupOutputs / kNumTiles) + i * 8 + (lane_idx % 4) * 2;
-                        const uint32_t chunk = (col / 16) ^ (row % 8);
-                        *reinterpret_cast<uint16_t*>(smem_q + row * kNumGroupOutputs + chunk * 16 + col % 16) =
-                            quantize_e4m3x2(final_accum[t][i * 4 + j], final_accum[t][i * 4 + j + 1], row_scale_rcp[j / 2]);
+                    for (uint32_t i = 0; i < kNumGateGroups; ++ i) {
+                        #pragma unroll
+                        for (uint32_t j = 0; j < 4; j += 2) {
+                            const uint32_t row = j == 0 ? r_0 : r_1;
+                            const uint32_t col = t * (kNumGroupOutputs / kNumTiles) + i * 8 + (lane_idx % 4) * 2;
+                            const uint32_t chunk = (col / 16) ^ (row % 8);
+                            *reinterpret_cast<uint16_t*>(smem_q + row * kNumGroupOutputs + chunk * 16 + col % 16) =
+                                quantize_e4m3x2(final_accum[t][i * 4 + j], final_accum[t][i * 4 + j + 1], row_scale_rcp[j / 2]);
+                        }
                     }
                 }
             }
 
             // Row scales, column-major: one lane per row
-            if (lane_idx % 4 == 0) {
+            if (lane_idx % 4 == 0 and has_rows) {
                 #pragma unroll
                 for (uint32_t r = 0; r < 2; ++ r) {
                     const uint32_t row = m_block_idx * BLOCK_M + (r == 0 ? r_0 : r_1);
