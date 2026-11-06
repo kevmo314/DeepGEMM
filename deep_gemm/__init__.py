@@ -67,9 +67,11 @@ from ._C import (
     fp8_gemm_tn, fp8_gemm_tt,
     # FP8 gate/up GEMM written as the SwiGLU's FP8 activation
     fp8_gemm_nt_swiglu,
+    m_grouped_fp8_gemm_nt_contiguous_swiglu,
     # Ahead-of-time compilation (no GPU needed)
     precompile_fp8_gemm_nt,
     precompile_fp8_gemm_nt_swiglu,
+    precompile_m_grouped_fp8_gemm_nt_contiguous_swiglu,
     m_grouped_fp4_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nn_contiguous,
