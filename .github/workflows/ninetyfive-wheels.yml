@@ -34,6 +34,9 @@ env:
   PRECOMPILE_NUM_SMS: "[132, 114]"
   # Fused gate/up projections whose SwiGLU fp8_gemm_nt_swiglu computes: (n, k).
   PRECOMPILE_SWIGLU_SHAPES: "[[34816, 5120]]"
+  # MoE gate/up projections whose SwiGLU m_grouped_fp8_gemm_nt_contiguous_swiglu
+  # computes: (num_experts, n, k), for Qwen4's 512 experts of I = 640, H = 2560.
+  PRECOMPILE_GROUPED_SWIGLU_SHAPES: "[[512, 1280, 2560]]"
 
 defaults:
   run:
@@ -135,6 +138,11 @@ jobs:
                       kernels.add(deep_gemm.precompile_fp8_gemm_nt(m, n, k, sms))
               for n, k in json.loads(os.environ["PRECOMPILE_SWIGLU_SHAPES"]):
                   kernels.update(deep_gemm.precompile_fp8_gemm_nt_swiglu(n, k, sms))
+
+              # One per expert block size of ninetyfive's grouped layout
+              for g, n, k in json.loads(os.environ["PRECOMPILE_GROUPED_SWIGLU_SHAPES"]):
+                  for block_m in (32, 64, 128):
+                      kernels.add(deep_gemm.precompile_m_grouped_fp8_gemm_nt_contiguous_swiglu(g, n, k, block_m, sms))
           print(f"{len(kernels)} kernels in {time.monotonic() - start:.0f}s")
           PY
           cd - && rm -rf precompiled/tmp && du -sh precompiled

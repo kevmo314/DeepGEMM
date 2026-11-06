@@ -881,9 +881,53 @@ static std::vector<std::string> precompile_fp8_gemm_nt_swiglu(const int& n, cons
     return out;
 }
 
+// SM90 M-grouped (MoE) `fp8_gemm_nt_swiglu`, over the contiguous psum layout of
+// `m_grouped_fp8_gemm_nt_contiguous(..., use_psum_layout=True)`: `a` (m, k) FP8 rows sorted by
+// expert, with (m, k / 128) M-major FP32 scales; `b` the [num_groups, n, k] gate/up weights (gate
+// rows, then up rows) with [num_groups, n / 128, k / 128] FP32 block scales; `grouped_layout` each
+// expert's end row (the next starts at it rounded up to `get_mk_alignment_for_contiguous_layout()`,
+// 32, 64 or 128). Writes SiLU(gate) * up as FP8 `qd` (m, n / 2) with 1x128 scales `sd`
+// (n / 256, m), a row-major tensor holding the column-major scales of `qd`. Rows between an
+// expert's end and the next one's start get garbage
+static void m_grouped_fp8_gemm_nt_contiguous_swiglu(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                                    const std::pair<torch::Tensor, torch::Tensor>& b,
+                                                    const torch::Tensor& qd, const torch::Tensor& sd,
+                                                    const torch::Tensor& grouped_layout) {
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 9);
+    const auto& [a_q, sfa] = a;
+    const auto& [b_q, sfb] = b;
+    DG_HOST_ASSERT(a_q.dim() == 2 and b_q.dim() == 3);
+    const auto m = static_cast<int>(a_q.size(0));
+    if (m == 0)
+        return;
+    sm90_m_grouped_fp8_gemm_contiguous_1d2d_swiglu(a_q, sfa, b_q, sfb, qd, sd, grouped_layout,
+                                                   static_cast<int>(b_q.size(0)), m,
+                                                   static_cast<int>(b_q.size(1)), static_cast<int>(b_q.size(2)),
+                                                   heuristics_runtime->get_mk_alignment_for_contiguous_layout());
+}
+
+// Ahead-of-time compilation of the SM90 kernel `m_grouped_fp8_gemm_nt_contiguous_swiglu` launches
+// for `num_groups` [n, k] gate/up weights with expert blocks of `block_m` rows (the contiguous
+// layout's alignment: 32, 64 or 128), for a GPU with `num_sms` SMs. Works without a GPU; the
+// kernel lands in the disk cache
+static std::string precompile_m_grouped_fp8_gemm_nt_contiguous_swiglu(const int& num_groups, const int& n, const int& k,
+                                                                      const int& block_m, const int& num_sms) {
+    if (not deep_jit::cuda::Device::emulated.has_value()) {
+        cudaDeviceProp prop{};
+        prop.major = 9, prop.minor = 0;
+        prop.multiProcessorCount = num_sms;
+        deep_jit::cuda::Device::emulated = prop;
+    }
+    return sm90_m_grouped_fp8_gemm_contiguous_1d2d_swiglu_precompile(num_groups, n, k, block_m, num_sms, "90a").string();
+}
+
 static void register_apis(pybind11::module_& m) {
     m.def("precompile_fp8_gemm_nt_swiglu", &precompile_fp8_gemm_nt_swiglu,
           py::arg("n"), py::arg("k"), py::arg("num_sms"));
+    m.def("m_grouped_fp8_gemm_nt_contiguous_swiglu", &m_grouped_fp8_gemm_nt_contiguous_swiglu,
+          py::arg("a"), py::arg("b"), py::arg("qd"), py::arg("sd"), py::arg("grouped_layout"));
+    m.def("precompile_m_grouped_fp8_gemm_nt_contiguous_swiglu", &precompile_m_grouped_fp8_gemm_nt_contiguous_swiglu,
+          py::arg("num_groups"), py::arg("n"), py::arg("k"), py::arg("block_m"), py::arg("num_sms"));
     m.def("fp8_gemm_nt_swiglu", &fp8_gemm_nt_swiglu,
           py::arg("a"), py::arg("b"), py::arg("qd"), py::arg("sd"), py::arg("m"));
     m.def("precompile_fp8_gemm_nt", &precompile_fp8_gemm_nt,
