@@ -118,8 +118,8 @@ jobs:
 
       - name: Precompile kernels
         # With the built extension (the cache keys hash its kernel headers) and the
-        # nvidia-cuda-nvcc wheel (deep_gemm's default CUDA_HOME); every prefill row
-        # count ninetyfive gives DeepGEMM: multiples of 128 up to 8192.
+        # nvidia-cuda-nvcc wheel (deep_gemm's default CUDA_HOME); every row count
+        # ninetyfive gives DeepGEMM: 17-127, then multiples of 128 up to 8192.
         run: |
           python -m pip install ${NVCC_WHEELS}
           unset CUDA_HOME CUDA_PATH
@@ -133,7 +133,9 @@ jobs:
           start, kernels = time.monotonic(), set()
           for sms in num_sms:
               for n, k in shapes:
-                  for m in range(128, 8193, 128):
+                  # Short calls too (ninetyfive's W8A8 starts at 17 rows):
+                  # their tiles (block_m 16-64) differ from the buckets'.
+                  for m in [*range(17, 128), *range(128, 8193, 128)]:
                       kernels.add(deep_gemm.precompile_fp8_gemm_nt(m, n, k, sms))
               for n, k in json.loads(os.environ["PRECOMPILE_SWIGLU_SHAPES"]):
                   kernels.update(deep_gemm.precompile_fp8_gemm_nt_swiglu(n, k, sms))
