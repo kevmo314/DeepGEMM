@@ -30,8 +30,10 @@ env:
   # (N, K) of the FP8 projections of the models ninetyfive serves, after fusion:
   # Qwen3.8-27B-FP8's qkv, in_proj_qkvz, o_proj/out_proj, gate_up_proj, down_proj.
   PRECOMPILE_SHAPES: "[[14336, 5120], [16384, 5120], [5120, 6144], [34816, 5120], [5120, 17408]]"
-  # H100 SXM, H200 and GH200; H100 PCIe.
-  PRECOMPILE_NUM_SMS: "[132, 114]"
+  # H100 SXM, H200 and GH200; H100 PCIe. 128, 120 and 112: ninetyfive launches
+  # some 27B prefill GEMMs on fewer SMs of a 132-SM GPU, where DeepGEMM's cost
+  # model otherwise picks slower tiles (fp8._DEEP_GEMM_SMS in ninetyfive).
+  PRECOMPILE_NUM_SMS: "[132, 128, 120, 114, 112]"
   # Fused gate/up projections whose SwiGLU fp8_gemm_nt_swiglu computes: (n, k).
   PRECOMPILE_SWIGLU_SHAPES: "[[34816, 5120]]"
 
