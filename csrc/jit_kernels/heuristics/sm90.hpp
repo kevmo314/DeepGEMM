@@ -1,5 +1,7 @@
 #pragma once
 
+#include <numeric>
+
 #include <cute/arch/mma_sm100_desc.hpp>
 // Reuse some types in the JIT modules
 #include <deep_gemm/common/types.cuh>
@@ -82,6 +84,16 @@ struct SM90ArchSpec {
                     for (int block_n: block_n_candidates) {
                         // 1D2D kernel unroll requirement
                         if (desc.kernel_type == KernelType::Kernel1D2D and block_n > block_k and (block_n % (block_n - block_k) != 0 and block_k % (block_n - block_k) != 0))
+                            continue;
+
+                        // 1D2D tiles whose B scales don't fall on a few fixed
+                        // K offsets (BLOCK_K / gcd(BLOCK_K, BLOCK_N) > 4: 80,
+                        // 112, 144, ...) miss the kernel's kShouldOptimize path
+                        // and choose a scale per element at runtime: 10-25%
+                        // slower than 128-aligned widths on compute-bound
+                        // shapes, which the cost model doesn't see (e.g. it
+                        // picks 256x112 for 2048x5120). Skinny shapes keep them.
+                        if (desc.kernel_type == KernelType::Kernel1D2D and desc.m >= 256 and block_k / std::gcd(block_k, block_n) > 4)
                             continue;
 
                         // Multicast legality for masked layout
