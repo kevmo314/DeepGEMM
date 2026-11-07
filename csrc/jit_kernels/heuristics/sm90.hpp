@@ -99,8 +99,10 @@ struct SM90ArchSpec {
                         // and choose a scale per element at runtime: 10-25%
                         // slower than 128-aligned widths on compute-bound
                         // shapes, which the cost model doesn't see (e.g. it
-                        // picks 256x112 for 2048x5120). Skinny shapes keep them.
-                        if (desc.kernel_type == KernelType::Kernel1D2D and desc.m >= 256 and block_k / std::gcd(block_k, block_n) > 4)
+                        // picks 256x112 for 2048x5120, and 64x80 for 128x5120:
+                        // 64x96 is 6-8% faster there). Inputs of up to 64
+                        // rows, where the kernel is memory-bound, keep them.
+                        if (desc.kernel_type == KernelType::Kernel1D2D and desc.m > 64 and block_k / std::gcd(block_k, block_n) > 4)
                             continue;
 
                         // Multicast legality for masked layout
