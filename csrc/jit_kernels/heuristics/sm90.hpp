@@ -66,7 +66,14 @@ struct SM90ArchSpec {
             // The number of k-groups is large (a heuristic)
             (desc.gemm_type == GemmType::KGroupedContiguous and desc.num_groups > 4) or
             // Not supported
-            (desc.gemm_type == GemmType::Batched);
+            (desc.gemm_type == GemmType::Batched) or
+            // Dense 1D2D FP8 GEMMs up to 2048 rows: the cost model credits a
+            // 2-CTA cluster with halving one operand's L2 traffic, but measured
+            // on a GH200 clusters are 1-5% slower at most of these shapes, and
+            // 10-28% where the paired dimension has an odd block count (e.g.
+            // M = 384 or 640 with block_m 128), whose unpaired blocks still run
+            // as clusters. Longer inputs measured mixed, so keep the model there.
+            (desc.kernel_type == KernelType::Kernel1D2D and desc.gemm_type == GemmType::Normal and desc.m <= 2048);
 
         // Enumerate all candidates
         std::vector<Layout> candidates;
