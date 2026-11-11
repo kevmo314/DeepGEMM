@@ -921,6 +921,24 @@ static std::string precompile_m_grouped_fp8_gemm_nt_contiguous_swiglu(const int&
     return sm90_m_grouped_fp8_gemm_contiguous_1d2d_swiglu_precompile(num_groups, n, k, block_m, num_sms, "90a").string();
 }
 
+// Ahead-of-time compilation of the SM90 kernel `m_grouped_fp8_gemm_nt_contiguous` launches with
+// `use_psum_layout=True` and `disable_ue8m0_cast=True` for `num_groups` [n, k] weights, expert
+// blocks of `block_m` rows, and `expected_m` rows per group, for a GPU with `num_sms` SMs.
+// Works without a GPU; the kernel lands in the disk cache.
+static std::string precompile_m_grouped_fp8_gemm_nt_contiguous(const int& num_groups, const int& n, const int& k,
+                                                               const int& block_m, const int& expected_m,
+                                                               const int& num_sms,
+                                                               const std::string& compiled_dims) {
+    if (not deep_jit::cuda::Device::emulated.has_value()) {
+        cudaDeviceProp prop{};
+        prop.major = 9, prop.minor = 0;
+        prop.multiProcessorCount = num_sms;
+        deep_jit::cuda::Device::emulated = prop;
+    }
+    return sm90_m_grouped_fp8_gemm_contiguous_1d2d_precompile(
+        num_groups, n, k, block_m, expected_m, num_sms, "90a", compiled_dims).string();
+}
+
 static void register_apis(pybind11::module_& m) {
     m.def("precompile_fp8_gemm_nt_swiglu", &precompile_fp8_gemm_nt_swiglu,
           py::arg("n"), py::arg("k"), py::arg("num_sms"));
@@ -928,6 +946,10 @@ static void register_apis(pybind11::module_& m) {
           py::arg("a"), py::arg("b"), py::arg("qd"), py::arg("sd"), py::arg("grouped_layout"));
     m.def("precompile_m_grouped_fp8_gemm_nt_contiguous_swiglu", &precompile_m_grouped_fp8_gemm_nt_contiguous_swiglu,
           py::arg("num_groups"), py::arg("n"), py::arg("k"), py::arg("block_m"), py::arg("num_sms"));
+    m.def("precompile_m_grouped_fp8_gemm_nt_contiguous", &precompile_m_grouped_fp8_gemm_nt_contiguous,
+          py::arg("num_groups"), py::arg("n"), py::arg("k"),
+          py::arg("block_m"), py::arg("expected_m"), py::arg("num_sms"),
+          py::arg("compiled_dims") = "nk");
     m.def("fp8_gemm_nt_swiglu", &fp8_gemm_nt_swiglu,
           py::arg("a"), py::arg("b"), py::arg("qd"), py::arg("sd"), py::arg("m"));
     m.def("precompile_fp8_gemm_nt", &precompile_fp8_gemm_nt,

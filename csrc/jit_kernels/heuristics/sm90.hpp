@@ -24,8 +24,12 @@ struct SM90ArchSpec {
             // TODO: check 256's performance
             block_m_candidates = {64, 128};
             // NOTES: smaller block M can avoid TMA L2 OOB bound
-            if (desc.m <= 16) block_m_candidates.push_back(16);
-            if (desc.m <= 32) block_m_candidates.push_back(32);
+            // NOTES: the 1D1D kernel only supports 64 (one math warpgroup) or 128 (two math warpgroups),
+            // so the smaller candidates are only for the 1D2D and BF16 kernels
+            if (desc.kernel_type != KernelType::Kernel1D1D) {
+                if (desc.m <= 16) block_m_candidates.push_back(16);
+                if (desc.m <= 32) block_m_candidates.push_back(32);
+            }
 
             // BF16 output GEMM supports 256
             if (desc.cd_dtype != torch::kFloat)
@@ -67,13 +71,14 @@ struct SM90ArchSpec {
             (desc.gemm_type == GemmType::KGroupedContiguous and desc.num_groups > 4) or
             // Not supported
             (desc.gemm_type == GemmType::Batched) or
-            // Dense 1D2D FP8 GEMMs up to 2048 rows: the cost model credits a
-            // 2-CTA cluster with halving one operand's L2 traffic, but measured
-            // on a GH200 clusters are 1-5% slower at most of these shapes, and
-            // 10-28% where the paired dimension has an odd block count (e.g.
-            // M = 384 or 640 with block_m 128), whose unpaired blocks still run
-            // as clusters. Longer inputs measured mixed, so keep the model there.
-            (desc.kernel_type == KernelType::Kernel1D2D and desc.gemm_type == GemmType::Normal and desc.m <= 2048);
+            // 1D2D FP8 GEMMs up to 2048 rows per group (dense or grouped): the
+            // cost model credits a 2-CTA cluster with halving one operand's L2
+            // traffic, but measured on a GH200 clusters are 1-5% slower at most
+            // of these shapes, and 10-28% where the paired dimension has an odd
+            // block count (e.g. M = 384 or 640 with block_m 128, or <= 1 block
+            // per expert in grouped GEMMs), whose unpaired blocks still run as
+            // clusters. Longer inputs measured mixed, so keep the model there.
+            (desc.kernel_type == KernelType::Kernel1D2D and desc.get_expected_m() <= 2048);
 
         // Enumerate all candidates
         std::vector<Layout> candidates;
@@ -101,8 +106,11 @@ struct SM90ArchSpec {
                         // shapes, which the cost model doesn't see (e.g. it
                         // picks 256x112 for 2048x5120, and 64x80 for 128x5120:
                         // 64x96 is 6-8% faster there). Inputs of up to 64
-                        // rows, where the kernel is memory-bound, keep them.
-                        if (desc.kernel_type == KernelType::Kernel1D2D and desc.m > 64 and block_k / std::gcd(block_k, block_n) > 4)
+                        // expected active rows, where the kernel is memory-bound,
+                        // keep them.
+                        if (desc.kernel_type == KernelType::Kernel1D2D and
+                            static_cast<int64_t>(desc.get_expected_m()) * desc.get_expected_num_groups() > 64 and
+                            block_k / std::gcd(block_k, block_n) > 4)
                             continue;
 
                         // Multicast legality for masked layout
