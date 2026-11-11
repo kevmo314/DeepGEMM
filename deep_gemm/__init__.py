@@ -72,6 +72,7 @@ from ._C import (
     precompile_fp8_gemm_nt,
     precompile_fp8_gemm_nt_swiglu,
     precompile_m_grouped_fp8_gemm_nt_contiguous_swiglu,
+    precompile_m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_fp4_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nn_contiguous,

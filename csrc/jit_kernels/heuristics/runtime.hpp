@@ -15,7 +15,7 @@ public:
     bool deterministic_algorithms = false;
     int block_m_multiple_of = 1;
     int block_n_multiple_of = 1;
-    int mk_alignment_for_contiguous_layout = kLegacyMKAlignmentForContiguousLayout;
+    inline static thread_local int mk_alignment_for_contiguous_layout = kLegacyMKAlignmentForContiguousLayout;
 
     void use_deterministic_algorithms(const bool enabled) {
         deterministic_algorithms = enabled;
