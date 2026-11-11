@@ -37,6 +37,9 @@ env:
   # MoE gate/up projections whose SwiGLU m_grouped_fp8_gemm_nt_contiguous_swiglu
   # computes: (num_experts, n, k), for Qwen4's 512 experts of I = 640, H = 2560.
   PRECOMPILE_GROUPED_SWIGLU_SHAPES: "[[512, 1280, 2560]]"
+  # MoE down (and LoRA gate/up) projections m_grouped_fp8_gemm_nt_contiguous
+  # computes over psum layout: (num_experts, n, k) for Qwen4's 512 experts.
+  PRECOMPILE_GROUPED_SHAPES: "[[512, 2560, 640], [512, 1280, 2560]]"
 
 defaults:
   run:
@@ -145,6 +148,10 @@ jobs:
               for g, n, k in json.loads(os.environ["PRECOMPILE_GROUPED_SWIGLU_SHAPES"]):
                   for block_m in (32, 64, 128):
                       kernels.add(deep_gemm.precompile_m_grouped_fp8_gemm_nt_contiguous_swiglu(g, n, k, block_m, sms))
+              for g, n, k in json.loads(os.environ["PRECOMPILE_GROUPED_SHAPES"]):
+                  for block_m, expected_ms in ((32, (16,)), (64, (64,)), (128, (128, 256, 384, 512))):
+                      for expected_m in expected_ms:
+                          kernels.add(deep_gemm.precompile_m_grouped_fp8_gemm_nt_contiguous(g, n, k, block_m, expected_m, sms))
           print(f"{len(kernels)} kernels in {time.monotonic() - start:.0f}s")
           PY
           cd - && rm -rf precompiled/tmp && du -sh precompiled

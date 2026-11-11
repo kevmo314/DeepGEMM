@@ -245,6 +245,41 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
     });
 }
 
+// Compiles the kernel `sm90_m_grouped_fp8_gemm_contiguous_1d2d` would launch for `num_groups`
+// [n, k] weights over the contiguous psum layout (`use_psum_layout=true`) with expert blocks of
+// `block_m` rows and `expected_m` rows per group into the disk cache, without a GPU: for `num_sms`
+// SMs and `arch` (e.g., "90a"). Returns the cache entry.
+static std::filesystem::path sm90_m_grouped_fp8_gemm_contiguous_1d2d_precompile(
+        const int& num_groups, const int& n, const int& k,
+        const int& block_m, const int& expected_m,
+        const int& num_sms, const std::string& arch,
+        const std::string& compiled_dims) {
+    const int prev_align = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
+    heuristics_runtime->set_mk_alignment_for_contiguous_layout(block_m);
+    const auto m = num_groups * align(expected_m, block_m);
+    const auto desc = GemmDesc {
+        .gemm_type = GemmType::MGroupedContiguousWithPsumLayout,
+        .kernel_type = KernelType::Kernel1D2D,
+        .m = m, .n = n, .k = k, .num_groups = num_groups,
+        .a_dtype = torch::kFloat8_e4m3fn, .b_dtype = torch::kFloat8_e4m3fn,
+        .cd_dtype = torch::kBFloat16,
+        .major_a = cute::UMMA::Major::K, .major_b = cute::UMMA::Major::K,
+        .with_accumulation = false,
+        .num_sms = num_sms,
+        .tc_util = 100,
+        .compiled_dims = compiled_dims,
+        .expected_m = expected_m, .expected_n = n, .expected_k = k,
+        .expected_num_groups = num_groups
+    };
+    const auto config = get_best_config<SM90ArchSpec>(desc);
+    heuristics_runtime->set_mk_alignment_for_contiguous_layout(prev_align);
+    deep_jit::cuda::CompilerOptions options;
+    options.arch = arch;
+    return jit->compile_without_load("sm90_m_grouped_fp8_gemm_contiguous_1d2d",
+                                     SM90FP8Gemm1D2DRuntime::generate(desc, config, cute::UMMA::Major::K),
+                                     options);
+}
+
 static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
                                                 const torch::Tensor& b, const torch::Tensor& sfb,
                                                 const torch::Tensor& d,
