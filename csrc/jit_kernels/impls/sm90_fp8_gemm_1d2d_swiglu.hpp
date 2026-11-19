@@ -29,6 +29,8 @@ public:
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_d;
         CUtensorMap tensor_map_sfa;
+        // Scales constant along K: `sm90_fp8_gemm_1d2d_swiglu_uniform_k_scales_impl`
+        bool uniform_k_scales = false;
     };
 
     static std::string generate(const Args& args) {
@@ -41,7 +43,7 @@ public:
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm90_fp8_gemm_1d2d_swiglu_impl<
+    auto ptr = reinterpret_cast<void*>(&{}<
         0, {}, {},
         {}, 128, 128,
         128, 128,
@@ -51,7 +53,8 @@ static void __instantiate_kernel() {{
         {}{}
     >);
 }};
-)", args.n, args.k, args.block_m, args.num_stages, num_math_threads(args.block_m), args.num_multicast, args.num_sms,
+)", args.uniform_k_scales ? "sm90_fp8_gemm_1d2d_swiglu_uniform_k_scales_impl" : "sm90_fp8_gemm_1d2d_swiglu_impl",
+    args.n, args.k, args.block_m, args.num_stages, num_math_threads(args.block_m), args.num_multicast, args.num_sms,
     grouped_args);
     }
 
@@ -94,7 +97,8 @@ static void __instantiate_kernel() {{
 static void sm90_fp8_gemm_1d2d_swiglu(const torch::Tensor& a, const torch::Tensor& sfa,
                                       const torch::Tensor& b, const torch::Tensor& sfb,
                                       const torch::Tensor& qd, const torch::Tensor& sd,
-                                      const int& m, const int& n, const int& k, const int& m_pad) {
+                                      const int& m, const int& n, const int& k, const int& m_pad,
+                                      const bool& uniform_k_scales = false) {
     DG_HOST_ASSERT(a.scalar_type() == torch::kFloat8_e4m3fn and b.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(qd.scalar_type() == torch::kFloat8_e4m3fn and sd.scalar_type() == torch::kFloat);
     DG_HOST_ASSERT(sfa.scalar_type() == torch::kFloat and sfb.scalar_type() == torch::kFloat);
@@ -136,6 +140,7 @@ static void sm90_fp8_gemm_1d2d_swiglu(const torch::Tensor& a, const torch::Tenso
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
         .tensor_map_sfa = tensor_map_sfa,
+        .uniform_k_scales = uniform_k_scales,
     });
 }
 
@@ -143,13 +148,15 @@ static void sm90_fp8_gemm_1d2d_swiglu(const torch::Tensor& a, const torch::Tenso
 // the disk cache, without a GPU: for `num_sms` SMs and `arch` (e.g., "90a"), with and without
 // the B multicast (which prompts longer than one 128-row block use). Returns the cache entries.
 static std::vector<std::filesystem::path> sm90_fp8_gemm_1d2d_swiglu_precompile(
-        const int& n, const int& k, const int& num_sms, const std::string& arch) {
+        const int& n, const int& k, const int& num_sms, const std::string& arch,
+        const bool& uniform_k_scales = false) {
     std::vector<std::filesystem::path> entries;
     for (const int num_multicast: {1, 2}) {
         SM90FP8Gemm1D2DSwiGLURuntime::Args args = {};
         args.n = n, args.k = k;
         args.block_m = 128, args.num_stages = SM90FP8Gemm1D2DSwiGLURuntime::get_num_stages(128, k);
         args.num_multicast = num_multicast, args.num_sms = num_sms;
+        args.uniform_k_scales = uniform_k_scales;
         deep_jit::cuda::CompilerOptions options;
         options.arch = arch;
         entries.push_back(jit->compile_without_load("sm90_fp8_gemm_1d2d_swiglu",
@@ -169,7 +176,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d_swiglu(const torch::Tensor& 
                                                            const torch::Tensor& qd, const torch::Tensor& sd,
                                                            const torch::Tensor& grouped_layout,
                                                            const int& num_groups, const int& m, const int& n, const int& k,
-                                                           const int& block_m) {
+                                                           const int& block_m, const bool& uniform_k_scales = false) {
     DG_HOST_ASSERT(a.scalar_type() == torch::kFloat8_e4m3fn and b.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(qd.scalar_type() == torch::kFloat8_e4m3fn and sd.scalar_type() == torch::kFloat);
     DG_HOST_ASSERT(sfa.scalar_type() == torch::kFloat and sfb.scalar_type() == torch::kFloat);
@@ -215,6 +222,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d_swiglu(const torch::Tensor& 
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
         .tensor_map_sfa = tensor_map_sfa,
+        .uniform_k_scales = uniform_k_scales,
     });
 }
 
@@ -223,13 +231,14 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d_swiglu(const torch::Tensor& 
 // `num_sms` SMs and `arch` (e.g., "90a"). Returns the cache entry.
 static std::filesystem::path sm90_m_grouped_fp8_gemm_contiguous_1d2d_swiglu_precompile(
         const int& num_groups, const int& n, const int& k, const int& block_m,
-        const int& num_sms, const std::string& arch) {
+        const int& num_sms, const std::string& arch, const bool& uniform_k_scales = false) {
     DG_HOST_ASSERT(block_m == 32 or block_m == 64 or block_m == 128);
     SM90FP8Gemm1D2DSwiGLURuntime::Args args = {};
     args.n = n, args.k = k;
     args.block_m = block_m, args.num_stages = SM90FP8Gemm1D2DSwiGLURuntime::get_num_stages(block_m, k);
     args.num_multicast = 1, args.num_sms = num_sms;
     args.gemm_type = GemmType::MGroupedContiguousWithPsumLayout, args.num_groups = num_groups;
+    args.uniform_k_scales = uniform_k_scales;
     deep_jit::cuda::CompilerOptions options;
     options.arch = arch;
     return jit->compile_without_load("sm90_fp8_gemm_1d2d_swiglu",

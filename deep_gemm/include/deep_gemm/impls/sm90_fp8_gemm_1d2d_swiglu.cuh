@@ -103,14 +103,15 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumTMAMulticast,
           uint32_t kNumSMs,
-          GemmType kGemmType = GemmType::Normal, uint32_t kNumGroups = 1>
-CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
-sm90_fp8_gemm_1d2d_swiglu_impl(float* sfb, float* sd, int* grouped_layout, uint32_t shape_m_pad,
+          GemmType kGemmType = GemmType::Normal, uint32_t kNumGroups = 1,
+          bool kUniformKScales = false>
+CUTLASS_DEVICE void
+sm90_fp8_gemm_1d2d_swiglu_body(float* sfb, float* sd, int* grouped_layout, uint32_t shape_m_pad,
                                uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-                               const __grid_constant__ cute::TmaDescriptor tensor_map_a,
-                               const __grid_constant__ cute::TmaDescriptor tensor_map_b,
-                               const __grid_constant__ cute::TmaDescriptor tensor_map_d,
-                               const __grid_constant__ cute::TmaDescriptor tensor_map_sfa) {
+                               const cute::TmaDescriptor& tensor_map_a,
+                               const cute::TmaDescriptor& tensor_map_b,
+                               const cute::TmaDescriptor& tensor_map_d,
+                               const cute::TmaDescriptor& tensor_map_sfa) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
     DG_STATIC_ASSERT(BLOCK_N == 128, "A tile is 64 gate and 64 up columns");
@@ -279,6 +280,8 @@ sm90_fp8_gemm_1d2d_swiglu_impl(float* sfb, float* sd, int* grouped_layout, uint3
             cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
 
             float accum[WGMMA::kNumAccum], final_accum[kNumTiles][WGMMA::kNumAccum] = {};
+            // With `kUniformKScales`, k block 0's scales (all k blocks share them)
+            float uniform_scales[4];
 
             #pragma unroll 4
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
@@ -294,43 +297,89 @@ sm90_fp8_gemm_1d2d_swiglu_impl(float* sfb, float* sd, int* grouped_layout, uint3
                 const float scale_a_1 = ptx::ld_shared(smem_sfa[stage_idx] + r_1);
                 const float scale_0_0 = scale_a_0 * scale_b_0, scale_1_0 = scale_a_1 * scale_b_0;
                 const float scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
+                if constexpr (kUniformKScales) {
+                    if (k_block_idx == 0)
+                        uniform_scales[0] = scale_0_0, uniform_scales[1] = scale_1_0, uniform_scales[2] = scale_0_1, uniform_scales[3] = scale_1_1;
+                }
 
-                #pragma unroll
-                for (uint32_t t = 0; t < kNumTiles; ++ t) {
+                if constexpr (kUniformKScales) {
                     #pragma unroll
-                    for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
-                        ptx::warpgroup_fence_operand(accum[i]);
-                    ptx::warpgroup_arrive();
-                    #pragma unroll
-                    for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
-                        a_desc.reg32_[0] = a_desc_base_lo + (k * WGMMA::K) / 16;
-                        b_desc.reg32_[0] = b_desc_base_lo + (t * SMEM_B_TILE_SIZE + k * WGMMA::K) / 16;
-                        WGMMA::wgmma(a_desc, b_desc, accum, k);
-                    }
-                    ptx::warpgroup_commit_batch();
-                    #pragma unroll
-                    for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
-                        ptx::warpgroup_fence_operand(accum[i]);
-                    ptx::warpgroup_wait<0>();
+                    for (uint32_t t = 0; t < kNumTiles; ++ t) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                            ptx::warpgroup_fence_operand(final_accum[t][i]);
+                        ptx::warpgroup_arrive();
+                        #pragma unroll
+                        for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
+                            a_desc.reg32_[0] = a_desc_base_lo + (k * WGMMA::K) / 16;
+                            b_desc.reg32_[0] = b_desc_base_lo + (t * SMEM_B_TILE_SIZE + k * WGMMA::K) / 16;
+                            WGMMA::wgmma(a_desc, b_desc, final_accum[t], k_block_idx > 0 or k > 0);
+                        }
+                        ptx::warpgroup_commit_batch();
+                        #pragma unroll
+                        for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                            ptx::warpgroup_fence_operand(final_accum[t][i]);
+                        ptx::warpgroup_wait<0>();
 
-                    if (t == kNumTiles - 1) {
-                        if constexpr (kNumTMAMulticast == 1) {
-                            lane_idx == 0 ? empty_barriers[stage_idx]->arrive() : void();
-                        } else {
-                            auto target_cta = scheduler.is_peer_cta_alive ? lane_idx : cute::block_rank_in_cluster();
-                            lane_idx < kNumTMAMulticast ? empty_barriers[stage_idx]->arrive(target_cta) : void();
+                        if (t == kNumTiles - 1) {
+                            if constexpr (kNumTMAMulticast == 1) {
+                                lane_idx == 0 ? empty_barriers[stage_idx]->arrive() : void();
+                            } else {
+                                auto target_cta = scheduler.is_peer_cta_alive ? lane_idx : cute::block_rank_in_cluster();
+                                lane_idx < kNumTMAMulticast ? empty_barriers[stage_idx]->arrive(target_cta) : void();
+                            }
+                        }
+
+                        // Accumulated in `final_accum` across k blocks: scale once, after the last
+                        if (k_block_idx == num_total_k_blocks - 1) {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                                const bool predicate = i < kNumGateGroups;
+                                final_accum[t][i * 4 + 0] *= (predicate ? uniform_scales[0] : uniform_scales[2]);
+                                final_accum[t][i * 4 + 1] *= (predicate ? uniform_scales[0] : uniform_scales[2]);
+                                final_accum[t][i * 4 + 2] *= (predicate ? uniform_scales[1] : uniform_scales[3]);
+                                final_accum[t][i * 4 + 3] *= (predicate ? uniform_scales[1] : uniform_scales[3]);
+                            }
                         }
                     }
-
-                    // Promote with scales, as `sm90_fp8_gemm_1d2d_impl` with its first
-                    // 64 columns (gate) on one B scale and the rest (up) on the other
+                } else {
                     #pragma unroll
-                    for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
-                        const bool predicate = i < kNumGateGroups;
-                        final_accum[t][i * 4 + 0] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 0];
-                        final_accum[t][i * 4 + 1] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 1];
-                        final_accum[t][i * 4 + 2] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 2];
-                        final_accum[t][i * 4 + 3] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 3];
+                    for (uint32_t t = 0; t < kNumTiles; ++ t) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                            ptx::warpgroup_fence_operand(accum[i]);
+                        ptx::warpgroup_arrive();
+                        #pragma unroll
+                        for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
+                            a_desc.reg32_[0] = a_desc_base_lo + (k * WGMMA::K) / 16;
+                            b_desc.reg32_[0] = b_desc_base_lo + (t * SMEM_B_TILE_SIZE + k * WGMMA::K) / 16;
+                            WGMMA::wgmma(a_desc, b_desc, accum, k);
+                        }
+                        ptx::warpgroup_commit_batch();
+                        #pragma unroll
+                        for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                            ptx::warpgroup_fence_operand(accum[i]);
+                        ptx::warpgroup_wait<0>();
+
+                        if (t == kNumTiles - 1) {
+                            if constexpr (kNumTMAMulticast == 1) {
+                                lane_idx == 0 ? empty_barriers[stage_idx]->arrive() : void();
+                            } else {
+                                auto target_cta = scheduler.is_peer_cta_alive ? lane_idx : cute::block_rank_in_cluster();
+                                lane_idx < kNumTMAMulticast ? empty_barriers[stage_idx]->arrive(target_cta) : void();
+                            }
+                        }
+
+                        // Promote with scales, as `sm90_fp8_gemm_1d2d_impl` with its first
+                        // 64 columns (gate) on one B scale and the rest (up) on the other
+                        #pragma unroll
+                        for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                            const bool predicate = i < kNumGateGroups;
+                            final_accum[t][i * 4 + 0] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 0];
+                            final_accum[t][i * 4 + 1] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 1];
+                            final_accum[t][i * 4 + 2] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 2];
+                            final_accum[t][i * 4 + 3] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 3];
+                        }
                     }
                 }
             }
@@ -411,6 +460,48 @@ sm90_fp8_gemm_1d2d_swiglu_impl(float* sfb, float* sd, int* grouped_layout, uint3
     if (blockIdx.x == 0 and threadIdx.x == 0)
         DG_DEVICE_ASSERT(false and "This kernel only support sm_90a");
 #endif
+}
+
+template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
+          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+          uint32_t kSwizzleAMode, uint32_t kSwizzleBMode,
+          uint32_t kNumStages,
+          uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
+          uint32_t kNumTMAMulticast,
+          uint32_t kNumSMs,
+          GemmType kGemmType = GemmType::Normal, uint32_t kNumGroups = 1>
+CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
+sm90_fp8_gemm_1d2d_swiglu_impl(float* sfb, float* sd, int* grouped_layout, uint32_t shape_m_pad,
+                               uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+                               const __grid_constant__ cute::TmaDescriptor tensor_map_a,
+                               const __grid_constant__ cute::TmaDescriptor tensor_map_b,
+                               const __grid_constant__ cute::TmaDescriptor tensor_map_d,
+                               const __grid_constant__ cute::TmaDescriptor tensor_map_sfa) {
+    sm90_fp8_gemm_1d2d_swiglu_body<SHAPE_M, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K, kSwizzleAMode, kSwizzleBMode,
+                                   kNumStages, kNumTMAThreads, kNumMathThreads, kNumTMAMulticast, kNumSMs, kGemmType, kNumGroups, false>(sfb, sd, grouped_layout, shape_m_pad, shape_m, shape_n, shape_k,
+                                   tensor_map_a, tensor_map_b, tensor_map_d, tensor_map_sfa);
+}
+
+// `sm90_fp8_gemm_1d2d_swiglu_impl` for scales constant along K (A's per row, B's per 128-row
+// block): WGMMA accumulates every k block into the same registers, scaled once at the end
+template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
+          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+          uint32_t kSwizzleAMode, uint32_t kSwizzleBMode,
+          uint32_t kNumStages,
+          uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
+          uint32_t kNumTMAMulticast,
+          uint32_t kNumSMs,
+          GemmType kGemmType = GemmType::Normal, uint32_t kNumGroups = 1>
+CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
+sm90_fp8_gemm_1d2d_swiglu_uniform_k_scales_impl(float* sfb, float* sd, int* grouped_layout, uint32_t shape_m_pad,
+                               uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+                               const __grid_constant__ cute::TmaDescriptor tensor_map_a,
+                               const __grid_constant__ cute::TmaDescriptor tensor_map_b,
+                               const __grid_constant__ cute::TmaDescriptor tensor_map_d,
+                               const __grid_constant__ cute::TmaDescriptor tensor_map_sfa) {
+    sm90_fp8_gemm_1d2d_swiglu_body<SHAPE_M, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K, kSwizzleAMode, kSwizzleBMode,
+                                   kNumStages, kNumTMAThreads, kNumMathThreads, kNumTMAMulticast, kNumSMs, kGemmType, kNumGroups, true>(sfb, sd, grouped_layout, shape_m_pad, shape_m, shape_n, shape_k,
+                                   tensor_map_a, tensor_map_b, tensor_map_d, tensor_map_sfa);
 }
 
 };  // namespace deep_gemm

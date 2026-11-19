@@ -24,17 +24,19 @@ public:
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_d;
         CUtensorMap tensor_map_sfa;
+        // Scales constant along K: `sm90_fp8_gemm_1d2d_uniform_k_scales_impl`
+        bool uniform_k_scales = false;
     };
 
     static std::string generate(const GemmDesc& gemm_desc, const GemmConfig& gemm_config,
-                                const cute::UMMA::Major& major_sfb) {
+                                const cute::UMMA::Major& major_sfb, const bool& uniform_k_scales = false) {
         return std::format(R"(
 #include <deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh>
 
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm90_fp8_gemm_1d2d_impl<
+    auto ptr = reinterpret_cast<void*>(&{}<
         {},
         {}, {}, {},
         {},
@@ -48,6 +50,7 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
+        uniform_k_scales ? "sm90_fp8_gemm_1d2d_uniform_k_scales_impl" : "sm90_fp8_gemm_1d2d_impl",
         to_string(major_sfb),
         get_compiled_dim(gemm_desc.m, 'm', gemm_desc.compiled_dims),
         get_compiled_dim(gemm_desc.n, 'n', gemm_desc.compiled_dims),
@@ -63,7 +66,7 @@ static void __instantiate_kernel() {{
     }
 
     static void compile_and_launch(const std::string& tag, const Args& args) {
-        const auto kernel = jit->compile(tag, generate(args.gemm_desc, args.gemm_config, args.major_sfb));
+        const auto kernel = jit->compile(tag, generate(args.gemm_desc, args.gemm_config, args.major_sfb, args.uniform_k_scales));
 
         // Launch
         jit->launch(
@@ -82,7 +85,7 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
                                const torch::Tensor& d,
                                const int& m, const int& n, const int& k,
                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
-                               const std::string& compiled_dims) {
+                               const std::string& compiled_dims, const bool& uniform_k_scales = false) {
     DG_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
@@ -138,6 +141,7 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
         .tensor_map_sfa = tensor_map_sfa,
+        .uniform_k_scales = uniform_k_scales,
     });
 }
 
@@ -146,7 +150,8 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
 // and `arch` (e.g., "90a"). Returns the cache entry.
 static std::filesystem::path sm90_fp8_gemm_1d2d_precompile(const int& m, const int& n, const int& k,
                                                            const int& num_sms, const std::string& arch,
-                                                           const std::string& compiled_dims) {
+                                                           const std::string& compiled_dims,
+                                                           const bool& uniform_k_scales = false) {
     const auto desc = GemmDesc {
         .gemm_type = GemmType::Normal,
         .kernel_type = KernelType::Kernel1D2D,
@@ -164,7 +169,7 @@ static std::filesystem::path sm90_fp8_gemm_1d2d_precompile(const int& m, const i
     deep_jit::cuda::CompilerOptions options;
     options.arch = arch;
     return jit->compile_without_load("sm90_fp8_gemm_1d2d",
-                                     SM90FP8Gemm1D2DRuntime::generate(desc, config, cute::UMMA::Major::K),
+                                     SM90FP8Gemm1D2DRuntime::generate(desc, config, cute::UMMA::Major::K, uniform_k_scales),
                                      options);
 }
 
@@ -176,7 +181,8 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
                                                     const std::string& compiled_dims,
                                                     const bool& use_psum_layout,
-                                                    const std::optional<int>& expected_m_for_psum_layout) {
+                                                    const std::optional<int>& expected_m_for_psum_layout,
+                                                    const bool& uniform_k_scales = false) {
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
@@ -242,6 +248,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
         .tensor_map_sfa = tensor_map_sfa,
+        .uniform_k_scales = uniform_k_scales,
     });
 }
 
@@ -253,7 +260,7 @@ static std::filesystem::path sm90_m_grouped_fp8_gemm_contiguous_1d2d_precompile(
         const int& num_groups, const int& n, const int& k,
         const int& block_m, const int& expected_m,
         const int& num_sms, const std::string& arch,
-        const std::string& compiled_dims) {
+        const std::string& compiled_dims, const bool& uniform_k_scales = false) {
     const int prev_align = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
     heuristics_runtime->set_mk_alignment_for_contiguous_layout(block_m);
     const auto m = num_groups * align(expected_m, block_m);
@@ -276,7 +283,7 @@ static std::filesystem::path sm90_m_grouped_fp8_gemm_contiguous_1d2d_precompile(
     deep_jit::cuda::CompilerOptions options;
     options.arch = arch;
     return jit->compile_without_load("sm90_m_grouped_fp8_gemm_contiguous_1d2d",
-                                     SM90FP8Gemm1D2DRuntime::generate(desc, config, cute::UMMA::Major::K),
+                                     SM90FP8Gemm1D2DRuntime::generate(desc, config, cute::UMMA::Major::K, uniform_k_scales),
                                      options);
 }
 
