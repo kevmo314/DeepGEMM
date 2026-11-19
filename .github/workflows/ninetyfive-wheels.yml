@@ -40,6 +40,8 @@ env:
   # MoE down (and LoRA gate/up) projections m_grouped_fp8_gemm_nt_contiguous
   # computes over psum layout: (num_experts, n, k) for Qwen4's 512 experts.
   PRECOMPILE_GROUPED_SHAPES: "[[512, 2560, 640], [512, 1280, 2560]]"
+  # Every kernel above with and without uniform_k_scales (scales constant along K).
+  PRECOMPILE_UNIFORM_K_SCALES: "[false, true]"
 
 defaults:
   run:
@@ -136,22 +138,25 @@ jobs:
           num_sms = json.loads(os.environ["PRECOMPILE_NUM_SMS"])
           start, kernels = time.monotonic(), set()
           for sms in num_sms:
+            for uks in json.loads(os.environ["PRECOMPILE_UNIFORM_K_SCALES"]):
               for n, k in shapes:
                   # Short calls too (ninetyfive's W8A8 starts at 17 rows):
                   # their tiles (block_m 16-64) differ from the buckets'.
                   for m in [*range(17, 128), *range(128, 8193, 128)]:
-                      kernels.add(deep_gemm.precompile_fp8_gemm_nt(m, n, k, sms))
+                      kernels.add(deep_gemm.precompile_fp8_gemm_nt(m, n, k, sms, uniform_k_scales=uks))
               for n, k in json.loads(os.environ["PRECOMPILE_SWIGLU_SHAPES"]):
-                  kernels.update(deep_gemm.precompile_fp8_gemm_nt_swiglu(n, k, sms))
+                  kernels.update(deep_gemm.precompile_fp8_gemm_nt_swiglu(n, k, sms, uniform_k_scales=uks))
 
               # One per expert block size of ninetyfive's grouped layout
               for g, n, k in json.loads(os.environ["PRECOMPILE_GROUPED_SWIGLU_SHAPES"]):
                   for block_m in (32, 64, 128):
-                      kernels.add(deep_gemm.precompile_m_grouped_fp8_gemm_nt_contiguous_swiglu(g, n, k, block_m, sms))
+                      kernels.add(deep_gemm.precompile_m_grouped_fp8_gemm_nt_contiguous_swiglu(
+                          g, n, k, block_m, sms, uniform_k_scales=uks))
               for g, n, k in json.loads(os.environ["PRECOMPILE_GROUPED_SHAPES"]):
                   for block_m, expected_ms in ((32, (16,)), (64, (64,)), (128, (128, 256, 384, 512))):
                       for expected_m in expected_ms:
-                          kernels.add(deep_gemm.precompile_m_grouped_fp8_gemm_nt_contiguous(g, n, k, block_m, expected_m, sms))
+                          kernels.add(deep_gemm.precompile_m_grouped_fp8_gemm_nt_contiguous(
+                              g, n, k, block_m, expected_m, sms, uniform_k_scales=uks))
           print(f"{len(kernels)} kernels in {time.monotonic() - start:.0f}s")
           PY
           cd - && rm -rf precompiled/tmp && du -sh precompiled
