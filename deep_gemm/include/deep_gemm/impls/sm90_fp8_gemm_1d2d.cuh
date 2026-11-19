@@ -43,14 +43,14 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs, GemmType kGemmType,
-          typename cd_dtype_t>
-CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
-sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
+          typename cd_dtype_t, bool kUniformKScales>
+CUTLASS_DEVICE void
+sm90_fp8_gemm_1d2d_body(float* sfb, int* grouped_layout,
                         uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_a,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_b,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_d,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_sfa) {
+                        const cute::TmaDescriptor& tensor_map_a,
+                        const cute::TmaDescriptor& tensor_map_b,
+                        const cute::TmaDescriptor& tensor_map_d,
+                        const cute::TmaDescriptor& tensor_map_sfa) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
@@ -275,6 +275,9 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 constexpr uint32_t kGap = math::constexpr_gcd(BLOCK_K, BLOCK_N) / 8;
                 constexpr uint32_t kEnd = kShouldOptimize ? BLOCK_K / 8 : 0;
 
+                // With `kUniformKScales`, the scales of k block 0 (all k blocks share them)
+                float uniform_scale_a[BLOCK_M / WAVE_BLOCK_M][2], uniform_scale_b[2];
+
                 // Dispatch `num_former_iters` and launch MMAs
                 dispatch_num_former_iters<0, kGap, kEnd>(kShouldOptimize ? num_former_iters : 0, [&](auto _) {
                     #pragma unroll 8
@@ -301,47 +304,97 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                             auto scale_a_0 = do_wgmma_store ? ptx::ld_shared(smem_sfa[stage_idx] + r_0 + m_offset) : 0;
                             auto scale_a_1 = do_wgmma_store ? ptx::ld_shared(smem_sfa[stage_idx] + r_1 + m_offset) : 0;
 
-                            // Commit WGMMA instructions
-                            #pragma unroll
-                            for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
-                                ptx::warpgroup_fence_operand(accum[i]);
-                            ptx::warpgroup_arrive();
-                            #pragma unroll
-                            for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
-                                a_desc.reg32_[0] = a_desc_base_lo + (m_offset * BLOCK_K + k * WGMMA::K) / 16;
-                                b_desc.reg32_[0] = b_desc_base_lo + k * WGMMA::K / 16;
-                                WGMMA::wgmma(a_desc, b_desc, accum, k);
-                            }
-                            ptx::warpgroup_commit_batch();
-                            #pragma unroll
-                            for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
-                                ptx::warpgroup_fence_operand(accum[i]);
-                            ptx::warpgroup_wait<0>();
+                            if constexpr (kUniformKScales) {
+                                // The scales are the same for every k block: WGMMA accumulates all of
+                                // them straight into `final_accum`, scaled once after the last
+                                auto wave_accum = final_accum + WGMMA::kNumAccum * local_idx;
+                                if (k_block_idx == 0) {
+                                    uniform_scale_a[local_idx][0] = scale_a_0, uniform_scale_a[local_idx][1] = scale_a_1;
+                                    uniform_scale_b[0] = scale_b_0;
+                                    if constexpr (not kMustUseUniformedScaleB)
+                                        uniform_scale_b[1] = scale_b_1;
+                                }
+                                #pragma unroll
+                                for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                                    ptx::warpgroup_fence_operand(wave_accum[i]);
+                                ptx::warpgroup_arrive();
+                                #pragma unroll
+                                for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
+                                    a_desc.reg32_[0] = a_desc_base_lo + (m_offset * BLOCK_K + k * WGMMA::K) / 16;
+                                    b_desc.reg32_[0] = b_desc_base_lo + k * WGMMA::K / 16;
+                                    WGMMA::wgmma(a_desc, b_desc, wave_accum, k_block_idx > 0 or k > 0);
+                                }
+                                ptx::warpgroup_commit_batch();
+                                #pragma unroll
+                                for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                                    ptx::warpgroup_fence_operand(wave_accum[i]);
+                                ptx::warpgroup_wait<0>();
 
-                            // Notify barrier arrival at the last warpgroup wave
-                            if (local_idx == BLOCK_M / WAVE_BLOCK_M - 1)
-                                empty_barrier_arrive();
+                                // Notify barrier arrival at the last warpgroup wave
+                                if (local_idx == BLOCK_M / WAVE_BLOCK_M - 1)
+                                    empty_barrier_arrive();
 
-                            // Skip promotion for the unfilled parts
-                            if (not do_wgmma_store)
-                                continue;
+                                // Scale once, after the last k block
+                                if (not do_wgmma_store or k_block_idx != num_total_k_blocks - 1)
+                                    continue;
+                                float scale_0_0 = uniform_scale_a[local_idx][0] * uniform_scale_b[0];
+                                float scale_1_0 = uniform_scale_a[local_idx][1] * uniform_scale_b[0];
+                                float scale_0_1, scale_1_1;
+                                if constexpr (not kMustUseUniformedScaleB) {
+                                    scale_0_1 = uniform_scale_a[local_idx][0] * uniform_scale_b[1];
+                                    scale_1_1 = uniform_scale_a[local_idx][1] * uniform_scale_b[1];
+                                }
+                                #pragma unroll
+                                for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                                    const bool predicate = kMustUseUniformedScaleB or i < num_former_iters;
+                                    wave_accum[i * 4 + 0] *= (predicate ? scale_0_0 : scale_0_1);
+                                    wave_accum[i * 4 + 1] *= (predicate ? scale_0_0 : scale_0_1);
+                                    wave_accum[i * 4 + 2] *= (predicate ? scale_1_0 : scale_1_1);
+                                    wave_accum[i * 4 + 3] *= (predicate ? scale_1_0 : scale_1_1);
+                                }
+                            } else {
+                                // Commit WGMMA instructions
+                                #pragma unroll
+                                for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                                    ptx::warpgroup_fence_operand(accum[i]);
+                                ptx::warpgroup_arrive();
+                                #pragma unroll
+                                for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
+                                    a_desc.reg32_[0] = a_desc_base_lo + (m_offset * BLOCK_K + k * WGMMA::K) / 16;
+                                    b_desc.reg32_[0] = b_desc_base_lo + k * WGMMA::K / 16;
+                                    WGMMA::wgmma(a_desc, b_desc, accum, k);
+                                }
+                                ptx::warpgroup_commit_batch();
+                                #pragma unroll
+                                for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                                    ptx::warpgroup_fence_operand(accum[i]);
+                                ptx::warpgroup_wait<0>();
 
-                            // Promote with scales
-                            // NOTES: making it as predicates is very important for performance, comparing to two loops
-                            float scale_0_0 = scale_a_0 * scale_b_0, scale_1_0 = scale_a_1 * scale_b_0;
-                            float scale_0_1, scale_1_1;
-                            if constexpr (not kMustUseUniformedScaleB)
-                                scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
+                                // Notify barrier arrival at the last warpgroup wave
+                                if (local_idx == BLOCK_M / WAVE_BLOCK_M - 1)
+                                    empty_barrier_arrive();
 
-                            auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
-                            #pragma unroll
-                            for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
-                                // NOTES: for unrolled `num_former_iters` cases, we expect the compiler to automatically make it a constant
-                                const bool predicate = kMustUseUniformedScaleB or i < num_former_iters;
-                                shifted_accum[i * 4 + 0] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 0];
-                                shifted_accum[i * 4 + 1] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 1];
-                                shifted_accum[i * 4 + 2] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 2];
-                                shifted_accum[i * 4 + 3] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 3];
+                                // Skip promotion for the unfilled parts
+                                if (not do_wgmma_store)
+                                    continue;
+
+                                // Promote with scales
+                                // NOTES: making it as predicates is very important for performance, comparing to two loops
+                                float scale_0_0 = scale_a_0 * scale_b_0, scale_1_0 = scale_a_1 * scale_b_0;
+                                float scale_0_1, scale_1_1;
+                                if constexpr (not kMustUseUniformedScaleB)
+                                    scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
+
+                                auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
+                                #pragma unroll
+                                for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                                    // NOTES: for unrolled `num_former_iters` cases, we expect the compiler to automatically make it a constant
+                                    const bool predicate = kMustUseUniformedScaleB or i < num_former_iters;
+                                    shifted_accum[i * 4 + 0] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 0];
+                                    shifted_accum[i * 4 + 1] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 1];
+                                    shifted_accum[i * 4 + 2] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 2];
+                                    shifted_accum[i * 4 + 3] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 3];
+                                }
                             }
                         }
                     }
@@ -445,6 +498,54 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     if (blockIdx.x == 0 and threadIdx.x == 0)
         DG_DEVICE_ASSERT(false and "This kernel only support sm_90a");
 #endif
+}
+
+template <cute::UMMA::Major kMajorSFB,
+          uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
+          uint32_t kNumGroups,
+          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+          uint32_t kSwizzleAMode, uint32_t kSwizzleBMode, uint32_t kSwizzleDMode,
+          uint32_t kNumStages,
+          uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
+          uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
+          uint32_t kNumSMs, GemmType kGemmType,
+          typename cd_dtype_t>
+CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
+sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
+                        uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_a,
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_b,
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_d,
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_sfa) {
+    sm90_fp8_gemm_1d2d_body<kMajorSFB, SHAPE_M, SHAPE_N, SHAPE_K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K,
+                            kSwizzleAMode, kSwizzleBMode, kSwizzleDMode, kNumStages, kNumTMAThreads, kNumMathThreads,
+                            kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs, kGemmType, cd_dtype_t, false>(sfb, grouped_layout, shape_m, shape_n, shape_k,
+                            tensor_map_a, tensor_map_b, tensor_map_d, tensor_map_sfa);
+}
+
+// `sm90_fp8_gemm_1d2d_impl` for scales constant along K (A's per row, B's per 128-row block):
+// WGMMA accumulates every k block into the same registers, scaled once at the end
+template <cute::UMMA::Major kMajorSFB,
+          uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
+          uint32_t kNumGroups,
+          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+          uint32_t kSwizzleAMode, uint32_t kSwizzleBMode, uint32_t kSwizzleDMode,
+          uint32_t kNumStages,
+          uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
+          uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
+          uint32_t kNumSMs, GemmType kGemmType,
+          typename cd_dtype_t>
+CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
+sm90_fp8_gemm_1d2d_uniform_k_scales_impl(float* sfb, int* grouped_layout,
+                        uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_a,
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_b,
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_d,
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_sfa) {
+    sm90_fp8_gemm_1d2d_body<kMajorSFB, SHAPE_M, SHAPE_N, SHAPE_K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K,
+                            kSwizzleAMode, kSwizzleBMode, kSwizzleDMode, kNumStages, kNumTMAThreads, kNumMathThreads,
+                            kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs, kGemmType, cd_dtype_t, true>(sfb, grouped_layout, shape_m, shape_n, shape_k,
+                            tensor_map_a, tensor_map_b, tensor_map_d, tensor_map_sfa);
 }
 
 };  // namespace deep_gemm

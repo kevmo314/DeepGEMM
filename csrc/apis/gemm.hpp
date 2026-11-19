@@ -76,6 +76,10 @@ static int check_k_grouped_args(const std::optional<std::vector<int>>& ks_cpu,
     return sum_k_if_ks_cpu_missing;
 }
 
+// `uniform_k_scales` (SM90 1D2D only): the caller guarantees both scales are constant along K
+// (A's: one per row, repeated over its K / 128 columns; B's: one per 128-row block, repeated over
+// K / 128), so WGMMA accumulates every k block in the same registers, scaled once at the end.
+// Faster, and differently rounded (no per-k-block FP32 promotion)
 static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                             const std::pair<torch::Tensor, torch::Tensor>& b,
                             const torch::Tensor& d,
@@ -86,7 +90,8 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                             const std::string& compiled_dims,
                             const bool& disable_ue8m0_cast,
                             const std::optional<float>& alpha,
-                            const std::shared_ptr<EpilogueClass>& epilogue_class) {
+                            const std::shared_ptr<EpilogueClass>& epilogue_class,
+                            const bool& uniform_k_scales) {
     // Shape must be `[M, K] @ [N, K].T`
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
@@ -120,12 +125,15 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         const int gran_n = recipe.has_value() ? std::get<1>(recipe.value()) : std::get<0>(recipe_b.value());
         if (gran_n == 1) {
+            DG_HOST_ASSERT(not uniform_k_scales and "`uniform_k_scales` requires SM90 1D2D (128x128 B scales)");
             sm90_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
         } else {
             const auto major_sfb = get_major_type_ab(sfb);
-            sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims);
+            sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims,
+                               uniform_k_scales);
         }
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
+        DG_HOST_ASSERT(not uniform_k_scales and "`uniform_k_scales` requires SM90 1D2D");
         sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
                                 major_a, major_b, compiled_dims, resolve_epilogue_class(epilogue_class, c, d, alpha));
     } else {
@@ -145,7 +153,7 @@ static void fp8_fp4_gemm_nn(const std::pair<torch::Tensor, torch::Tensor>& a,
                             const std::optional<float>& alpha,
                             const std::shared_ptr<EpilogueClass>& epilogue_class) {
     fp8_fp4_gemm_nt(a, {b.first.transpose(0, 1), b.second.transpose(0, 1)},
-                    d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha, epilogue_class);
+                    d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha, epilogue_class, false);
 }
 
 static void fp8_fp4_gemm_tn(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -161,7 +169,7 @@ static void fp8_fp4_gemm_tn(const std::pair<torch::Tensor, torch::Tensor>& a,
                             const std::shared_ptr<EpilogueClass>& epilogue_class) {
     fp8_fp4_gemm_nt({a.first.transpose(0, 1), a.second.transpose(0, 1)},
                     {b.first.transpose(0, 1), b.second.transpose(0, 1)},
-                    d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha, epilogue_class);
+                    d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha, epilogue_class, false);
 }
 
 static void fp8_fp4_gemm_tt(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -176,9 +184,13 @@ static void fp8_fp4_gemm_tt(const std::pair<torch::Tensor, torch::Tensor>& a,
                             const std::optional<float>& alpha,
                             const std::shared_ptr<EpilogueClass>& epilogue_class) {
     fp8_fp4_gemm_nt({a.first.transpose(0, 1), a.second.transpose(0, 1)}, b,
-                    d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha, epilogue_class);
+                    d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha, epilogue_class, false);
 }
 
+// `uniform_k_scales` (SM90 1D2D only): the caller guarantees both scales are constant along K
+// (A's: one per row, repeated over its K / 128 columns; B's: one per 128-row block, repeated over
+// K / 128), so WGMMA accumulates every k block in the same registers, scaled once at the end.
+// Faster, and differently rounded (no per-k-block FP32 promotion)
 static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
                                                  const std::pair<torch::Tensor, torch::Tensor>& b,
                                                  const torch::Tensor& d,
@@ -191,7 +203,8 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
                                                  const bool& use_psum_layout,
                                                  const bool& ensure_zero_padding,
                                                  const std::optional<int>& expected_m_for_psum_layout,
-                                                 const std::shared_ptr<EpilogueClass>& epilogue_class) {
+                                                 const std::shared_ptr<EpilogueClass>& epilogue_class,
+                                                 const bool& uniform_k_scales) {
     // Shape must be `[M, K] @ [G, N, K].mT`
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
@@ -239,8 +252,10 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm90_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                 num_groups, m, n, k, major_a, major_b, major_sfb,
-                                                compiled_dims, use_psum_layout, expected_m_for_psum_layout);
+                                                compiled_dims, use_psum_layout, expected_m_for_psum_layout,
+                                                uniform_k_scales);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
+        DG_HOST_ASSERT(not uniform_k_scales and "`uniform_k_scales` requires SM90 1D2D");
         sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                      num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
                                                      compiled_dims, use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout,
@@ -264,7 +279,7 @@ static void m_grouped_fp8_fp4_gemm_nn_contiguous(const std::pair<torch::Tensor, 
                                                  const std::shared_ptr<EpilogueClass>& epilogue_class) {
     m_grouped_fp8_fp4_gemm_nt_contiguous(a, {b.first.transpose(1, 2), b.second.transpose(1, 2)},
                                          d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast,
-                                         use_psum_layout, ensure_zero_padding, std::nullopt, epilogue_class);
+                                         use_psum_layout, ensure_zero_padding, std::nullopt, epilogue_class, false);
 }
 
 static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -837,14 +852,15 @@ static void batched_symm(const torch::Tensor& a, const torch::Tensor& b,
 // GEMMs with 1x128 SFA and 128x128 SFB (FP32, as with `disable_ue8m0_cast`) and BF16 output, for a
 // GPU with `num_sms` SMs. Works without a GPU; the kernel lands in the disk cache.
 static std::string precompile_fp8_gemm_nt(const int& m, const int& n, const int& k,
-                                          const int& num_sms, const std::string& compiled_dims) {
+                                          const int& num_sms, const std::string& compiled_dims,
+                                          const bool& uniform_k_scales) {
     if (not deep_jit::cuda::Device::emulated.has_value()) {
         cudaDeviceProp prop{};
         prop.major = 9, prop.minor = 0;
         prop.multiProcessorCount = num_sms;
         deep_jit::cuda::Device::emulated = prop;
     }
-    return sm90_fp8_gemm_1d2d_precompile(m, n, k, num_sms, "90a", compiled_dims).string();
+    return sm90_fp8_gemm_1d2d_precompile(m, n, k, num_sms, "90a", compiled_dims, uniform_k_scales).string();
 }
 
 // SM90 FP8 [m, k] x [n, k]^T GEMM of a fused gate/up projection (`b`: gate rows then up rows,
@@ -854,7 +870,7 @@ static std::string precompile_fp8_gemm_nt(const int& m, const int& n, const int&
 static void fp8_gemm_nt_swiglu(const std::pair<torch::Tensor, torch::Tensor>& a,
                                const std::pair<torch::Tensor, torch::Tensor>& b,
                                const torch::Tensor& qd, const torch::Tensor& sd,
-                               const int& m) {
+                               const int& m, const bool& uniform_k_scales) {
     DG_HOST_ASSERT(jit->device.get_arch_major() == 9);
     const auto& [a_q, sfa] = a;
     const auto& [b_q, sfb] = b;
@@ -863,12 +879,13 @@ static void fp8_gemm_nt_swiglu(const std::pair<torch::Tensor, torch::Tensor>& a,
         return;
     sm90_fp8_gemm_1d2d_swiglu(a_q, sfa, b_q, sfb, qd, sd, m,
                               static_cast<int>(b_q.size(0)), static_cast<int>(b_q.size(1)),
-                              static_cast<int>(qd.size(0)));
+                              static_cast<int>(qd.size(0)), uniform_k_scales);
 }
 
 // Ahead-of-time compilation of the SM90 kernels `fp8_gemm_nt_swiglu` launches for an [n, k]
 // gate/up weight, for a GPU with `num_sms` SMs. Works without a GPU; they land in the disk cache
-static std::vector<std::string> precompile_fp8_gemm_nt_swiglu(const int& n, const int& k, const int& num_sms) {
+static std::vector<std::string> precompile_fp8_gemm_nt_swiglu(const int& n, const int& k, const int& num_sms,
+                                                              const bool& uniform_k_scales) {
     if (not deep_jit::cuda::Device::emulated.has_value()) {
         cudaDeviceProp prop{};
         prop.major = 9, prop.minor = 0;
@@ -876,7 +893,7 @@ static std::vector<std::string> precompile_fp8_gemm_nt_swiglu(const int& n, cons
         deep_jit::cuda::Device::emulated = prop;
     }
     std::vector<std::string> out;
-    for (const auto& entry: sm90_fp8_gemm_1d2d_swiglu_precompile(n, k, num_sms, "90a"))
+    for (const auto& entry: sm90_fp8_gemm_1d2d_swiglu_precompile(n, k, num_sms, "90a", uniform_k_scales))
         out.push_back(entry.string());
     return out;
 }
@@ -892,7 +909,8 @@ static std::vector<std::string> precompile_fp8_gemm_nt_swiglu(const int& n, cons
 static void m_grouped_fp8_gemm_nt_contiguous_swiglu(const std::pair<torch::Tensor, torch::Tensor>& a,
                                                     const std::pair<torch::Tensor, torch::Tensor>& b,
                                                     const torch::Tensor& qd, const torch::Tensor& sd,
-                                                    const torch::Tensor& grouped_layout) {
+                                                    const torch::Tensor& grouped_layout,
+                                                    const bool& uniform_k_scales) {
     DG_HOST_ASSERT(jit->device.get_arch_major() == 9);
     const auto& [a_q, sfa] = a;
     const auto& [b_q, sfb] = b;
@@ -903,7 +921,8 @@ static void m_grouped_fp8_gemm_nt_contiguous_swiglu(const std::pair<torch::Tenso
     sm90_m_grouped_fp8_gemm_contiguous_1d2d_swiglu(a_q, sfa, b_q, sfb, qd, sd, grouped_layout,
                                                    static_cast<int>(b_q.size(0)), m,
                                                    static_cast<int>(b_q.size(1)), static_cast<int>(b_q.size(2)),
-                                                   heuristics_runtime->get_mk_alignment_for_contiguous_layout());
+                                                   heuristics_runtime->get_mk_alignment_for_contiguous_layout(),
+                                                   uniform_k_scales);
 }
 
 // Ahead-of-time compilation of the SM90 kernel `m_grouped_fp8_gemm_nt_contiguous_swiglu` launches
@@ -911,14 +930,16 @@ static void m_grouped_fp8_gemm_nt_contiguous_swiglu(const std::pair<torch::Tenso
 // layout's alignment: 32, 64 or 128), for a GPU with `num_sms` SMs. Works without a GPU; the
 // kernel lands in the disk cache
 static std::string precompile_m_grouped_fp8_gemm_nt_contiguous_swiglu(const int& num_groups, const int& n, const int& k,
-                                                                      const int& block_m, const int& num_sms) {
+                                                                      const int& block_m, const int& num_sms,
+                                                                      const bool& uniform_k_scales) {
     if (not deep_jit::cuda::Device::emulated.has_value()) {
         cudaDeviceProp prop{};
         prop.major = 9, prop.minor = 0;
         prop.multiProcessorCount = num_sms;
         deep_jit::cuda::Device::emulated = prop;
     }
-    return sm90_m_grouped_fp8_gemm_contiguous_1d2d_swiglu_precompile(num_groups, n, k, block_m, num_sms, "90a").string();
+    return sm90_m_grouped_fp8_gemm_contiguous_1d2d_swiglu_precompile(num_groups, n, k, block_m, num_sms, "90a",
+                                                                   uniform_k_scales).string();
 }
 
 // Ahead-of-time compilation of the SM90 kernel `m_grouped_fp8_gemm_nt_contiguous` launches with
@@ -928,7 +949,8 @@ static std::string precompile_m_grouped_fp8_gemm_nt_contiguous_swiglu(const int&
 static std::string precompile_m_grouped_fp8_gemm_nt_contiguous(const int& num_groups, const int& n, const int& k,
                                                                const int& block_m, const int& expected_m,
                                                                const int& num_sms,
-                                                               const std::string& compiled_dims) {
+                                                               const std::string& compiled_dims,
+                                                               const bool& uniform_k_scales) {
     if (not deep_jit::cuda::Device::emulated.has_value()) {
         cudaDeviceProp prop{};
         prop.major = 9, prop.minor = 0;
@@ -936,25 +958,28 @@ static std::string precompile_m_grouped_fp8_gemm_nt_contiguous(const int& num_gr
         deep_jit::cuda::Device::emulated = prop;
     }
     return sm90_m_grouped_fp8_gemm_contiguous_1d2d_precompile(
-        num_groups, n, k, block_m, expected_m, num_sms, "90a", compiled_dims).string();
+        num_groups, n, k, block_m, expected_m, num_sms, "90a", compiled_dims, uniform_k_scales).string();
 }
 
 static void register_apis(pybind11::module_& m) {
     m.def("precompile_fp8_gemm_nt_swiglu", &precompile_fp8_gemm_nt_swiglu,
-          py::arg("n"), py::arg("k"), py::arg("num_sms"));
+          py::arg("n"), py::arg("k"), py::arg("num_sms"), py::arg("uniform_k_scales") = false);
     m.def("m_grouped_fp8_gemm_nt_contiguous_swiglu", &m_grouped_fp8_gemm_nt_contiguous_swiglu,
-          py::arg("a"), py::arg("b"), py::arg("qd"), py::arg("sd"), py::arg("grouped_layout"));
+          py::arg("a"), py::arg("b"), py::arg("qd"), py::arg("sd"), py::arg("grouped_layout"),
+          py::arg("uniform_k_scales") = false);
     m.def("precompile_m_grouped_fp8_gemm_nt_contiguous_swiglu", &precompile_m_grouped_fp8_gemm_nt_contiguous_swiglu,
-          py::arg("num_groups"), py::arg("n"), py::arg("k"), py::arg("block_m"), py::arg("num_sms"));
+          py::arg("num_groups"), py::arg("n"), py::arg("k"), py::arg("block_m"), py::arg("num_sms"),
+          py::arg("uniform_k_scales") = false);
     m.def("precompile_m_grouped_fp8_gemm_nt_contiguous", &precompile_m_grouped_fp8_gemm_nt_contiguous,
           py::arg("num_groups"), py::arg("n"), py::arg("k"),
           py::arg("block_m"), py::arg("expected_m"), py::arg("num_sms"),
-          py::arg("compiled_dims") = "nk");
+          py::arg("compiled_dims") = "nk", py::arg("uniform_k_scales") = false);
     m.def("fp8_gemm_nt_swiglu", &fp8_gemm_nt_swiglu,
-          py::arg("a"), py::arg("b"), py::arg("qd"), py::arg("sd"), py::arg("m"));
+          py::arg("a"), py::arg("b"), py::arg("qd"), py::arg("sd"), py::arg("m"),
+          py::arg("uniform_k_scales") = false);
     m.def("precompile_fp8_gemm_nt", &precompile_fp8_gemm_nt,
           py::arg("m"), py::arg("n"), py::arg("k"), py::arg("num_sms"),
-          py::arg("compiled_dims") = "nk");
+          py::arg("compiled_dims") = "nk", py::arg("uniform_k_scales") = false);
 
     // FP8 FP4 GEMMs
     m.def("fp8_fp4_gemm_nt", &fp8_fp4_gemm_nt,
@@ -964,7 +989,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk",
           py::arg("disable_ue8m0_cast") = false,
           py::arg("alpha") = std::nullopt,
-          py::arg("epilogue") = nullptr);
+          py::arg("epilogue") = nullptr,
+          py::arg("uniform_k_scales") = false);
     m.def("fp8_fp4_gemm_nn", &fp8_fp4_gemm_nn,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
@@ -998,7 +1024,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("use_psum_layout") = false,
           py::arg("ensure_zero_padding") = true,
           py::arg("expected_m_for_psum_layout") = std::nullopt,
-          py::arg("epilogue") = nullptr);
+          py::arg("epilogue") = nullptr,
+          py::arg("uniform_k_scales") = false);
     m.def("m_grouped_fp8_fp4_gemm_nn_contiguous", &m_grouped_fp8_fp4_gemm_nn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("recipe") = std::nullopt,
